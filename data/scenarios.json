@@ -1,0 +1,28 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "base",
+      "version": 2,
+      "description": "Current baseline market snapshot",
+      "equity_prices": {"FROG": 50},
+      "bond_yields": {"FROG-BOND-1Y": 0.03},
+      "fx_rates": {"USD": 7.1, "EUR": 7.8}
+    },
+    {
+      "scenario_id": "equity_crash",
+      "version": 2,
+      "description": "Equity down 30%; USD appreciates",
+      "equity_prices": {"FROG": 35},
+      "bond_yields": {"FROG-BOND-1Y": 0.03},
+      "fx_rates": {"USD": 7.25, "EUR": 7.8}
+    },
+    {
+      "scenario_id": "rates_up_fx_shock",
+      "version": 2,
+      "description": "Bond yield rises and EUR depreciates",
+      "equity_prices": {"FROG": 50},
+      "bond_yields": {"FROG-BOND-1Y": 0.04},
+      "fx_rates": {"USD": 7.1, "EUR": 7.6}
+    }
+  ]
+}

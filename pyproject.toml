@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "investment-risk-platform"
+version = "0.1.0"
+description = "Versioned portfolio revaluation and stress-testing platform"
+requires-python = ">=3.10"
+
+[project.scripts]
+risk-platform = "risk_platform.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["risk_platform*"]

@@ -1,0 +1,28 @@
+{
+  "holdings": [
+    {
+      "id": "usd-cash",
+      "name": "USD Cash",
+      "asset_type": "cash",
+      "currency": "USD",
+      "quantity": 1000
+    },
+    {
+      "id": "frog-equity",
+      "name": "Frog Robotics",
+      "asset_type": "equity",
+      "currency": "USD",
+      "quantity": 20,
+      "market_data_key": "FROG"
+    },
+    {
+      "id": "euro-bond",
+      "name": "Fictional Euro Zero",
+      "asset_type": "zero_coupon_bond",
+      "currency": "EUR",
+      "quantity": 10000,
+      "market_data_key": "FROG-BOND-1Y",
+      "years_to_maturity": 1
+    }
+  ]
+}
