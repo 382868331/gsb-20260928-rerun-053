@@ -1,0 +1,8 @@
+[project]
+name = "investment-risk-platform"
+version = "0.1.0"
+description = "Scenario-driven portfolio revaluation with holding attribution"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

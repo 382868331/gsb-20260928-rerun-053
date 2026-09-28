@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "as_of": "2026-09-29T12:00:00Z",
+  "base_currency": "USD",
+  "description": "Intentionally incomplete scenario for failure testing",
+  "fx_rates_to_base": {
+    "USD": "1",
+    "EUR": "1.08"
+  },
+  "prices": [
+    {"symbol": "FICTEQ", "currency": "USD", "price": "80"},
+    {"symbol": "FICTBOND", "currency": "EUR", "price": "170"},
+    {"symbol": "FICTFUND", "currency": "JPY", "price": "1800"}
+  ]
+}

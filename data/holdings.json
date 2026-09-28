@@ -1,0 +1,25 @@
+{
+  "holdings": [
+    {
+      "holding_id": "h001",
+      "symbol": "FICTEQ",
+      "asset_type": "equity",
+      "quantity": "10",
+      "currency": "USD"
+    },
+    {
+      "holding_id": "h002",
+      "symbol": "FICTBOND",
+      "asset_type": "bond",
+      "quantity": "4",
+      "currency": "EUR"
+    },
+    {
+      "holding_id": "h003",
+      "symbol": "FICTFUND",
+      "asset_type": "fund",
+      "quantity": "50",
+      "currency": "JPY"
+    }
+  ]
+}

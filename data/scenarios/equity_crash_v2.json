@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "as_of": "2026-09-29T11:00:00Z",
+  "base_currency": "USD",
+  "description": "Updated fictional equity crash scenario; v1 remains archived",
+  "fx_rates_to_base": {
+    "USD": "1",
+    "EUR": "1.02",
+    "JPY": "0.0070"
+  },
+  "prices": [
+    {"symbol": "FICTEQ", "currency": "USD", "price": "60"},
+    {"symbol": "FICTBOND", "currency": "EUR", "price": "185"},
+    {"symbol": "FICTFUND", "currency": "JPY", "price": "1800"}
+  ]
+}

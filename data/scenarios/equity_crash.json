@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "as_of": "2026-09-29T09:30:00Z",
+  "base_currency": "USD",
+  "description": "Fictional equity drawdown with wider credit and FX moves",
+  "fx_rates_to_base": {
+    "USD": "1",
+    "EUR": "1.05",
+    "JPY": "0.0072"
+  },
+  "prices": [
+    {"symbol": "FICTEQ", "currency": "USD", "price": "70"},
+    {"symbol": "FICTBOND", "currency": "EUR", "price": "190"},
+    {"symbol": "FICTFUND", "currency": "JPY", "price": "1900"}
+  ]
+}

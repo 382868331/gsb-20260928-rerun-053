@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "as_of": "2026-09-29T10:15:00Z",
+  "base_currency": "USD",
+  "description": "Fictional rates and currency shock",
+  "fx_rates_to_base": {
+    "USD": "1",
+    "EUR": "1.15",
+    "JPY": "0.0070"
+  },
+  "prices": [
+    {"symbol": "FICTEQ", "currency": "USD", "price": "95"},
+    {"symbol": "FICTBOND", "currency": "EUR", "price": "180"},
+    {"symbol": "FICTFUND", "currency": "JPY", "price": "2100"}
+  ]
+}
