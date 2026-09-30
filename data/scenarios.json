@@ -23,6 +23,14 @@
       "equity_prices": {"FROG": 50},
       "bond_yields": {"FROG-BOND-1Y": 0.04},
       "fx_rates": {"USD": 7.1, "EUR": 7.6}
+    },
+    {
+      "scenario_id": "risk_off_combo",
+      "version": 2,
+      "description": "Equity down, yield up and USD appreciates / EUR depreciates together",
+      "equity_prices": {"FROG": 40},
+      "bond_yields": {"FROG-BOND-1Y": 0.05},
+      "fx_rates": {"USD": 7.2, "EUR": 7.5}
     }
   ]
 }

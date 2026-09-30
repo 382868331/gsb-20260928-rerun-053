@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from risk_platform.attribution import FACTOR_EFFECT_FIELDS
+
 
 @dataclass(frozen=True, slots=True)
 class Contribution:
@@ -19,6 +21,13 @@ class Contribution:
     base_value: float
     base_scenario_value: float
     pnl_vs_base: float
+    factor_equity_price: float = 0.0
+    factor_bond_yield: float = 0.0
+    factor_fx: float = 0.0
+    interaction_equity_yield: float = 0.0
+    interaction_equity_fx: float = 0.0
+    interaction_yield_fx: float = 0.0
+    interaction_all: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +38,13 @@ class ScenarioResult:
     total_base_value: float
     total_pnl_vs_base: float
     contributions: tuple[Contribution, ...]
+    factor_equity_price: float = 0.0
+    factor_bond_yield: float = 0.0
+    factor_fx: float = 0.0
+    interaction_equity_yield: float = 0.0
+    interaction_equity_fx: float = 0.0
+    interaction_yield_fx: float = 0.0
+    interaction_all: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +109,11 @@ def run_result_from_dict(payload: dict[str, Any]) -> RunResult:
             total_base_value=float(item["total_base_value"]),
             total_pnl_vs_base=float(item["total_pnl_vs_base"]),
             contributions=tuple(Contribution(**entry) for entry in item["contributions"]),
+            **{
+                field: float(item[field])
+                for field in FACTOR_EFFECT_FIELDS
+                if field in item
+            },
         )
         for item in payload["results"]
     )
