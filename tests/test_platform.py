@@ -53,6 +53,71 @@ class RiskPlatformTests(unittest.TestCase):
             sum(item.pnl_vs_base for item in crash.contributions),
         )
 
+    def test_factor_attribution_matches_hand_calculated_effects(self) -> None:
+        run = self.engine.run("attribution", self.holdings, self.scenarios)
+        crash = next(item for item in run.results if item.scenario_id == "equity_crash")
+        effects = {
+            (item.holding_id, item.factors): item.effect
+            for item in crash.factor_effects
+        }
+
+        # Equity: 20 shares, FROG 50 -> 35, USD 7.1 -> 7.25.
+        self.assertAlmostEqual(effects[("frog-equity", ("price",))], 20 * 35 * 7.1 - 7100)
+        self.assertAlmostEqual(effects[("frog-equity", ("fx",))], 20 * 50 * 7.25 - 7100)
+        self.assertAlmostEqual(
+            effects[("frog-equity", ("fx", "price"))],
+            20 * 35 * 7.25 - 20 * 35 * 7.1 - 20 * 50 * 7.25 + 7100,
+        )
+        # Cash only moves with FX.
+        self.assertAlmostEqual(effects[("usd-cash", ("fx",))], 150)
+        # Bond is untouched in this scenario.
+        self.assertAlmostEqual(effects[("euro-bond", ("fx",))], 0.0)
+        self.assertAlmostEqual(effects[("euro-bond", ("rates",))], 0.0)
+        self.assertAlmostEqual(effects[("euro-bond", ("fx", "rates"))], 0.0)
+
+        # Effects decompose the total exactly, with no residual allocation.
+        self.assertAlmostEqual(
+            sum(item.effect for item in crash.factor_effects),
+            crash.total_pnl_vs_base,
+        )
+
+    def test_rates_fx_interaction_matches_hand_calculation(self) -> None:
+        run = self.engine.run("attribution-rates", self.holdings, self.scenarios)
+        shock = next(item for item in run.results if item.scenario_id == "rates_up_fx_shock")
+        effects = {
+            (item.holding_id, item.factors): item.effect
+            for item in shock.factor_effects
+        }
+
+        base_bond = 10000 * math.exp(-0.03) * 7.8
+        rates_only = 10000 * math.exp(-0.04) * 7.8
+        fx_only = 10000 * math.exp(-0.03) * 7.6
+        both = 10000 * math.exp(-0.04) * 7.6
+        self.assertAlmostEqual(effects[("euro-bond", ("rates",))], rates_only - base_bond)
+        self.assertAlmostEqual(effects[("euro-bond", ("fx",))], fx_only - base_bond)
+        self.assertAlmostEqual(
+            effects[("euro-bond", ("fx", "rates"))],
+            both - rates_only - fx_only + base_bond,
+        )
+        self.assertAlmostEqual(
+            sum(item.effect for item in shock.factor_effects),
+            shock.total_pnl_vs_base,
+        )
+
+    def test_factor_effects_survive_result_store_round_trip(self) -> None:
+        run = self.engine.run("round-trip", self.holdings, self.scenarios)
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResultStore(directory)
+            store.save(run)
+            loaded = store.load("round-trip")
+        self.assertEqual(run, loaded)
+        shock = next(item for item in loaded.results if item.scenario_id == "rates_up_fx_shock")
+        self.assertTrue(shock.factor_effects)
+        self.assertAlmostEqual(
+            sum(item.effect for item in shock.factor_effects),
+            shock.total_pnl_vs_base,
+        )
+
     def test_missing_market_data_fails_without_publishing_total(self) -> None:
         scenarios = load_scenarios(ROOT / "data" / "scenarios.json")
         broken = [

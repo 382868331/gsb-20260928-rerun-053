@@ -8,6 +8,10 @@
 - `risk_platform/scenarios.py`：不可变市场场景、场景指纹和缺失数据检查。
 - `risk_platform/pricing.py`：现金、股票、零息债券定价模型。
 - `risk_platform/engine.py`：在同一场景内同时取价格、收益率和汇率。
+- `risk_platform/attribution.py`：把基准到压力场景的盈亏精确分解为各驱动因素
+  （价格、利率、汇率）的主效应与交互项。对每个持仓枚举其驱动因素的全部子集，
+  用 inclusion-exclusion 求每个非空子集的效应；各效应之和严格等于该持仓盈亏，
+  不做任何主观分摊。
 - `risk_platform/results.py`：完整结果对象与原子发布仓库。
 - `risk_platform/metrics.py`：基于同一份场景结果扩展风险指标，不重新定价。
 
@@ -31,4 +35,5 @@ python -m risk_platform.cli \
 python -m unittest discover -s tests -v
 ```
 
-测试包含少量虚构资产的逐项公式对照、持仓贡献求和、缺数据失败、旧版本追溯、指标复用和 CLI 发布。
+测试包含少量虚构资产的逐项公式对照、持仓贡献求和、因素主效应与交互项的手算对照、
+缺数据失败、旧版本追溯、指标复用和 CLI 发布。

@@ -2,9 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from risk_platform.attribution import attribute_holding
 from risk_platform.holdings import Holding
 from risk_platform.pricing import CashPricer, EquityPricer, Pricer, ZeroCouponBondPricer
-from risk_platform.results import Contribution, RunResult, ScenarioResult, with_relative_values
+from risk_platform.results import (
+    Contribution,
+    FactorEffect,
+    RunResult,
+    ScenarioResult,
+    with_relative_values,
+)
 from risk_platform.scenarios import MarketScenario
 
 
@@ -52,6 +59,9 @@ class RevaluationEngine:
                 self._to_scenario_result(
                     scenario,
                     with_relative_values(contributions, base_values),
+                    factor_effects=self._attribute_scenario(
+                        holdings, base_scenario, scenario
+                    ),
                 )
             )
 
@@ -95,6 +105,7 @@ class RevaluationEngine:
     def _to_scenario_result(
         scenario: MarketScenario,
         contributions: tuple[Contribution, ...],
+        factor_effects: tuple[FactorEffect, ...] = (),
     ) -> ScenarioResult:
         return ScenarioResult(
             scenario_id=scenario.scenario_id,
@@ -103,4 +114,26 @@ class RevaluationEngine:
             total_base_value=sum(item.base_value for item in contributions),
             total_pnl_vs_base=sum(item.pnl_vs_base for item in contributions),
             contributions=contributions,
+            factor_effects=factor_effects,
         )
+
+    def _attribute_scenario(
+        self,
+        holdings: list[Holding],
+        base_scenario: MarketScenario,
+        scenario: MarketScenario,
+    ) -> tuple[FactorEffect, ...]:
+        effects: list[FactorEffect] = []
+        for holding in holdings:
+            pricer = self.pricers[holding.asset_type]
+            for factors, effect in attribute_holding(
+                holding, pricer, base_scenario, scenario
+            ):
+                effects.append(
+                    FactorEffect(
+                        holding_id=holding.id,
+                        factors=factors,
+                        effect=effect,
+                    )
+                )
+        return tuple(effects)

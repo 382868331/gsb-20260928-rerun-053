@@ -22,6 +22,13 @@ class Contribution:
 
 
 @dataclass(frozen=True, slots=True)
+class FactorEffect:
+    holding_id: str
+    factors: tuple[str, ...]
+    effect: float
+
+
+@dataclass(frozen=True, slots=True)
 class ScenarioResult:
     scenario_id: str
     scenario_version: int
@@ -29,6 +36,7 @@ class ScenarioResult:
     total_base_value: float
     total_pnl_vs_base: float
     contributions: tuple[Contribution, ...]
+    factor_effects: tuple[FactorEffect, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +101,14 @@ def run_result_from_dict(payload: dict[str, Any]) -> RunResult:
             total_base_value=float(item["total_base_value"]),
             total_pnl_vs_base=float(item["total_pnl_vs_base"]),
             contributions=tuple(Contribution(**entry) for entry in item["contributions"]),
+            factor_effects=tuple(
+                FactorEffect(
+                    holding_id=entry["holding_id"],
+                    factors=tuple(entry["factors"]),
+                    effect=float(entry["effect"]),
+                )
+                for entry in item.get("factor_effects", ())
+            ),
         )
         for item in payload["results"]
     )
