@@ -1,0 +1,112 @@
+{
+  "paths": [
+    {
+      "path_id": "stagflation_ladder",
+      "version": 1,
+      "description": "Equity slides first, then rates rise, then USD strengthens",
+      "steps": [
+        {
+          "step_id": "t0",
+          "scenario": {
+            "scenario_id": "ladder_t0",
+            "version": 1,
+            "description": "Initial snapshot",
+            "equity_prices": {"FROG": 50},
+            "bond_yields": {"FROG-BOND-1Y": 0.03},
+            "fx_rates": {"USD": 7.1, "EUR": 7.8}
+          }
+        },
+        {
+          "step_id": "t1_equity_slide",
+          "scenario": {
+            "scenario_id": "ladder_t1",
+            "version": 1,
+            "description": "Equity down 20%",
+            "equity_prices": {"FROG": 40},
+            "bond_yields": {"FROG-BOND-1Y": 0.03},
+            "fx_rates": {"USD": 7.1, "EUR": 7.8}
+          },
+          "cash_flows": [{"currency": "USD", "amount": 200}],
+          "trades": [{"holding_id": "frog-equity", "quantity_delta": -5}]
+        },
+        {
+          "step_id": "t2_rates_up",
+          "scenario": {
+            "scenario_id": "ladder_t2",
+            "version": 1,
+            "description": "Rates up 100bp",
+            "equity_prices": {"FROG": 40},
+            "bond_yields": {"FROG-BOND-1Y": 0.04},
+            "fx_rates": {"USD": 7.1, "EUR": 7.8}
+          }
+        },
+        {
+          "step_id": "t3_fx_shock",
+          "scenario": {
+            "scenario_id": "ladder_t3",
+            "version": 1,
+            "description": "USD strengthens, EUR weakens",
+            "equity_prices": {"FROG": 40},
+            "bond_yields": {"FROG-BOND-1Y": 0.04},
+            "fx_rates": {"USD": 7.3, "EUR": 7.5}
+          },
+          "trades": [{"holding_id": "euro-bond", "quantity_delta": -2000}]
+        }
+      ]
+    },
+    {
+      "path_id": "stagflation_ladder",
+      "version": 2,
+      "description": "Revised: FX shock arrives before the rates move",
+      "steps": [
+        {
+          "step_id": "t0",
+          "scenario": {
+            "scenario_id": "ladder_t0",
+            "version": 2,
+            "description": "Initial snapshot",
+            "equity_prices": {"FROG": 50},
+            "bond_yields": {"FROG-BOND-1Y": 0.03},
+            "fx_rates": {"USD": 7.1, "EUR": 7.8}
+          }
+        },
+        {
+          "step_id": "t1_equity_slide",
+          "scenario": {
+            "scenario_id": "ladder_t1",
+            "version": 2,
+            "description": "Equity down 20%",
+            "equity_prices": {"FROG": 40},
+            "bond_yields": {"FROG-BOND-1Y": 0.03},
+            "fx_rates": {"USD": 7.1, "EUR": 7.8}
+          },
+          "cash_flows": [{"currency": "USD", "amount": 200}],
+          "trades": [{"holding_id": "frog-equity", "quantity_delta": -5}]
+        },
+        {
+          "step_id": "t2_fx_shock",
+          "scenario": {
+            "scenario_id": "ladder_t2",
+            "version": 2,
+            "description": "USD strengthens, EUR weakens",
+            "equity_prices": {"FROG": 40},
+            "bond_yields": {"FROG-BOND-1Y": 0.03},
+            "fx_rates": {"USD": 7.3, "EUR": 7.5}
+          },
+          "trades": [{"holding_id": "euro-bond", "quantity_delta": -2000}]
+        },
+        {
+          "step_id": "t3_rates_up",
+          "scenario": {
+            "scenario_id": "ladder_t3",
+            "version": 2,
+            "description": "Rates up 100bp",
+            "equity_prices": {"FROG": 40},
+            "bond_yields": {"FROG-BOND-1Y": 0.04},
+            "fx_rates": {"USD": 7.3, "EUR": 7.5}
+          }
+        }
+      ]
+    }
+  ]
+}

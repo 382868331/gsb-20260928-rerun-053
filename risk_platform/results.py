@@ -133,3 +133,143 @@ def with_relative_values(
         )
         for contribution in contributions
     )
+
+
+@dataclass(frozen=True, slots=True)
+class PathStepResult:
+    """One step of a path replay, explaining the move from the previous step."""
+
+    step_id: str
+    scenario_id: str
+    scenario_version: int
+    scenario_fingerprint: str
+    market_effect: float
+    trade_effect: float
+    interaction_effect: float
+    cash_flow_effect: float
+    total_change: float
+    portfolio_value: float
+    contributions: tuple[Contribution, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyPathResult:
+    """Replay of one path under one policy (hold or rebalance)."""
+
+    policy: str
+    complete: bool
+    initial_value: float
+    final_value: float
+    total_market_effect: float
+    total_trade_effect: float
+    total_interaction_effect: float
+    total_cash_flow_effect: float
+    total_change: float
+    steps: tuple[PathStepResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PathScenarioResult:
+    path_id: str
+    path_version: int
+    path_fingerprint: str
+    status: str
+    missing_data: str | None
+    policies: tuple[PolicyPathResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PathRunResult:
+    run_id: str
+    results: tuple[PathScenarioResult, ...]
+
+    @property
+    def complete(self) -> bool:
+        return all(item.status == "complete" for item in self.results)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def path_run_result_from_dict(payload: dict[str, Any]) -> PathRunResult:
+    results = []
+    for item in payload["results"]:
+        policies = tuple(
+            PolicyPathResult(
+                policy=policy["policy"],
+                complete=bool(policy["complete"]),
+                initial_value=float(policy["initial_value"]),
+                final_value=float(policy["final_value"]),
+                total_market_effect=float(policy["total_market_effect"]),
+                total_trade_effect=float(policy["total_trade_effect"]),
+                total_interaction_effect=float(policy["total_interaction_effect"]),
+                total_cash_flow_effect=float(policy["total_cash_flow_effect"]),
+                total_change=float(policy["total_change"]),
+                steps=tuple(
+                    PathStepResult(
+                        step_id=step["step_id"],
+                        scenario_id=step["scenario_id"],
+                        scenario_version=int(step["scenario_version"]),
+                        scenario_fingerprint=step["scenario_fingerprint"],
+                        market_effect=float(step["market_effect"]),
+                        trade_effect=float(step["trade_effect"]),
+                        interaction_effect=float(step["interaction_effect"]),
+                        cash_flow_effect=float(step["cash_flow_effect"]),
+                        total_change=float(step["total_change"]),
+                        portfolio_value=float(step["portfolio_value"]),
+                        contributions=tuple(
+                            Contribution(**entry) for entry in step["contributions"]
+                        ),
+                    )
+                    for step in policy["steps"]
+                ),
+            )
+            for policy in item["policies"]
+        )
+        results.append(
+            PathScenarioResult(
+                path_id=item["path_id"],
+                path_version=int(item["path_version"]),
+                path_fingerprint=item["path_fingerprint"],
+                status=item["status"],
+                missing_data=item.get("missing_data"),
+                policies=policies,
+            )
+        )
+    return PathRunResult(run_id=payload["run_id"], results=tuple(results))
+
+
+def compare_path_results(
+    runs: list[PathRunResult],
+) -> dict[str, dict[str, dict[str, float | str | None]]]:
+    """Side-by-side replay table keyed by path_id, then "v<version>/<policy>".
+
+    Historical and revised versions of the same path appear next to each
+    other so their totals can be reconciled column by column.
+    """
+    table: dict[str, dict[str, dict[str, float | str | None]]] = {}
+    for run in runs:
+        for result in run.results:
+            columns = table.setdefault(result.path_id, {})
+            for policy in result.policies:
+                key = f"v{result.path_version}/{policy.policy}"
+                columns[key] = {
+                    "run_id": run.run_id,
+                    "status": result.status,
+                    "fingerprint": result.path_fingerprint,
+                    "initial_value": policy.initial_value,
+                    "final_value": policy.final_value,
+                    "total_change": policy.total_change,
+                    "market_effect": policy.total_market_effect,
+                    "trade_effect": policy.total_trade_effect,
+                    "interaction_effect": policy.total_interaction_effect,
+                    "cash_flow_effect": policy.total_cash_flow_effect,
+                }
+    return table
+
+
+def load_path_run_result(directory: str | Path, run_id: str) -> PathRunResult:
+    path = ResultStore(directory).path_for(run_id)
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return path_run_result_from_dict(payload)
