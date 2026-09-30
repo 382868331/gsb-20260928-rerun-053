@@ -8,6 +8,13 @@
       "quantity": 1000
     },
     {
+      "id": "eur-cash",
+      "name": "EUR Cash",
+      "asset_type": "cash",
+      "currency": "EUR",
+      "quantity": 0
+    },
+    {
       "id": "frog-equity",
       "name": "Frog Robotics",
       "asset_type": "equity",

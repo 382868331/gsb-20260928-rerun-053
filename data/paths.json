@@ -1,0 +1,82 @@
+{
+  "paths": [
+    {
+      "path_id": "recession",
+      "version": 1,
+      "description": "Historical 2008-style replay: hold positions, receive a USD coupon",
+      "strategy": "hold",
+      "steps": [
+        {
+          "label": "t0",
+          "market": {
+            "scenario_id": "base",
+            "version": 2,
+            "equity_prices": {"FROG": 50},
+            "bond_yields": {"FROG-BOND-1Y": 0.03},
+            "fx_rates": {"USD": 7.1, "EUR": 7.8}
+          }
+        },
+        {
+          "label": "t1",
+          "cash_flows": [{"holding_id": "usd-cash", "amount": 50}],
+          "market": {
+            "scenario_id": "t1",
+            "version": 1,
+            "equity_prices": {"FROG": 40},
+            "bond_yields": {"FROG-BOND-1Y": 0.035},
+            "fx_rates": {"USD": 7.2, "EUR": 7.7}
+          }
+        },
+        {
+          "label": "t2",
+          "market": {
+            "scenario_id": "t2",
+            "version": 1,
+            "equity_prices": {"FROG": 35},
+            "bond_yields": {"FROG-BOND-1Y": 0.04},
+            "fx_rates": {"USD": 7.25, "EUR": 7.6}
+          }
+        }
+      ]
+    },
+    {
+      "path_id": "recession",
+      "version": 2,
+      "description": "Revised replay: pre-arranged de-risking, sell half the Euro bond at t1",
+      "strategy": "rebalance",
+      "steps": [
+        {
+          "label": "t0",
+          "market": {
+            "scenario_id": "base",
+            "version": 2,
+            "equity_prices": {"FROG": 50},
+            "bond_yields": {"FROG-BOND-1Y": 0.03},
+            "fx_rates": {"USD": 7.1, "EUR": 7.8}
+          }
+        },
+        {
+          "label": "t1",
+          "trades": [{"holding_id": "euro-bond", "quantity_delta": -5000}],
+          "market": {
+            "scenario_id": "t1",
+            "version": 1,
+            "equity_prices": {"FROG": 40},
+            "bond_yields": {"FROG-BOND-1Y": 0.035},
+            "fx_rates": {"USD": 7.2, "EUR": 7.7}
+          }
+        },
+        {
+          "label": "t2",
+          "market": {
+            "scenario_id": "t2",
+            "version": 1,
+            "equity_prices": {"FROG": 35},
+            "bond_yields": {"FROG-BOND-1Y": 0.04},
+            "fx_rates": {"USD": 7.25, "EUR": 7.6}
+          }
+        }
+      ]
+    }
+  ]
+}
