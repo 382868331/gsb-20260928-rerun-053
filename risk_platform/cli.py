@@ -5,7 +5,7 @@ import uuid
 
 from risk_platform.engine import RevaluationEngine
 from risk_platform.holdings import load_holdings
-from risk_platform.path_engine import DEFAULT_POLICIES, PathEngine
+from risk_platform.path_engine import PathEngine
 from risk_platform.paths import load_paths
 from risk_platform.results import ResultStore
 from risk_platform.scenarios import load_scenarios
@@ -18,8 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--paths", help="Ordered multi-step stress paths JSON")
     parser.add_argument(
         "--policies",
-        default=",".join(DEFAULT_POLICIES),
-        help="Comma-separated path replay policies (hold,rebalance)",
+        help="Comma-separated policies; defaults to hold,rebalance and every action plan",
     )
     parser.add_argument("--results-dir", required=True)
     parser.add_argument("--run-id", default=f"run-{uuid.uuid4().hex[:12]}")
@@ -46,7 +45,11 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.paths:
         paths = load_paths(args.paths)
-        policies = tuple(item.strip() for item in args.policies.split(",") if item.strip())
+        policies = (
+            None
+            if args.policies is None
+            else tuple(item.strip() for item in args.policies.split(",") if item.strip())
+        )
         path_result = PathEngine.default().run(
             run_id=f"{args.run_id}-paths",
             holdings=holdings,

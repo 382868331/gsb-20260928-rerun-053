@@ -45,11 +45,23 @@ python -m risk_platform.cli \
   --run-id demo
 ```
 
-路径文件按步骤给出市场情景、现金流（收到后以同币种现金再投资）和再平衡交易。
-结果写入 <run-id>-paths.json，每个 (path_id, version) 下分 hold / rebalance
-两种策略给出逐步归因与合计；缺数据的路径以 partial 状态保存已完成步骤。
-用 risk_platform.results.compare_path_results 可以把多次运行或同一路径的
-新旧版本并排成表核对。
+路径文件可在路径级配置 `limits`，同时约束累计损失、币种基础币种敞口和单一
+资产/资产类型集中度；也可在 `action_plans` 中为触发点预设减仓或换汇方案。
+每个时点评估处置前与处置后快照，分别记录第一次触及各限额的位置、超限来源、
+超限幅度、仍超限指标和因缺资料无法确认的指标；某个指标回到范围内会标记为
+`confirmed_within`，不会掩盖其他仍为 `breached` 的指标。
+
+处置只使用触发时点场景可见的价格、汇率和可用持仓/现金。卖出的费用从成交
+收入中扣除，换汇只改变现金币种；`action_effect` 仅为费用等真实经济影响，
+`cash_flow_from_actions` 只统计资产变现形成的现金，内部换汇不重复计为现金流。
+成交明细同时给出处置前后总金额，差额可与 `action_effect` 逐项核对。
+
+结果写入 <run-id>-paths.json，每个 (path_id, version) 默认并列 hold、
+rebalance 和每个 `action:<plan_id>` 方案；缺数据的路径以 partial 状态保存
+已完成步骤和已确认越界事实。用 risk_platform.results.compare_path_results
+可以把多次运行或同一路径的新旧版本并排成表核对。限额与方案属于路径定义，
+会进入路径 SHA-256 指纹；修改后续市场情景会产生新版本，旧 run 中触发依据、
+方案版本和指纹仍可追溯。
 
 旧 run 保存自己的场景版本和指纹。场景文件更新后，仍可用旧 run id 读取并追溯当时的输入，新 run 会获得新的版本和指纹。
 

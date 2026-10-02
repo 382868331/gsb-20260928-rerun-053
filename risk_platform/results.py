@@ -150,6 +150,48 @@ class PathStepResult:
     total_change: float
     portfolio_value: float
     contributions: tuple[Contribution, ...]
+    limit_checks: tuple["LimitViolation", ...] = ()
+    action_plan_id: str | None = None
+    action_effect: float = 0.0
+    action_fees: float = 0.0
+    cash_flow_from_actions: float = 0.0
+    action_reconciliation: "ActionReconciliation | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class LimitViolation:
+    metric: str
+    limit_value: float | None
+    observed_value: float | None
+    excess: float | None
+    source: str
+    source_currency: str | None = None
+    source_holding_id: str | None = None
+    status: str = "breached"
+    trigger_step_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ActionFill:
+    type: str
+    holding_id: str | None
+    quantity: float
+    from_currency: str | None
+    to_currency: str | None
+    local_amount: float
+    base_gross_amount: float
+    fee_base_amount: float
+    base_net_amount: float
+
+
+@dataclass(frozen=True, slots=True)
+class ActionReconciliation:
+    pre_action_value: float
+    post_action_value: float
+    action_effect: float
+    fees: float
+    cash_flow_from_actions: float
+    fills: tuple[ActionFill, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +208,12 @@ class PolicyPathResult:
     total_cash_flow_effect: float
     total_change: float
     steps: tuple[PathStepResult, ...]
+    total_action_effect: float = 0.0
+    total_action_fees: float = 0.0
+    total_cash_flow_from_actions: float = 0.0
+    first_trigger_step_id: str | None = None
+    first_breaches: tuple[LimitViolation, ...] = ()
+    unresolved_metrics: tuple[LimitViolation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +224,8 @@ class PathScenarioResult:
     status: str
     missing_data: str | None
     policies: tuple[PolicyPathResult, ...]
+    first_trigger_step_id: str | None = None
+    trigger_basis_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,8 +244,40 @@ class PathRunResult:
 def path_run_result_from_dict(payload: dict[str, Any]) -> PathRunResult:
     results = []
     for item in payload["results"]:
-        policies = tuple(
-            PolicyPathResult(
+        policies = []
+        for policy in item["policies"]:
+            steps = tuple(
+                PathStepResult(
+                    step_id=step["step_id"],
+                    scenario_id=step["scenario_id"],
+                    scenario_version=int(step["scenario_version"]),
+                    scenario_fingerprint=step["scenario_fingerprint"],
+                    market_effect=float(step["market_effect"]),
+                    trade_effect=float(step["trade_effect"]),
+                    interaction_effect=float(step["interaction_effect"]),
+                    cash_flow_effect=float(step["cash_flow_effect"]),
+                    total_change=float(step["total_change"]),
+                    portfolio_value=float(step["portfolio_value"]),
+                    contributions=tuple(
+                        Contribution(**entry) for entry in step["contributions"]
+                    ),
+                    limit_checks=tuple(
+                        LimitViolation(**entry) for entry in step.get("limit_checks", ())
+                    ),
+                    action_plan_id=step.get("action_plan_id"),
+                    action_effect=float(step.get("action_effect", 0.0)),
+                    action_fees=float(step.get("action_fees", 0.0)),
+                    cash_flow_from_actions=float(
+                        step.get("cash_flow_from_actions", 0.0)
+                    ),
+                    action_reconciliation=_action_reconciliation_from_dict(
+                        step.get("action_reconciliation")
+                    ),
+                )
+                for step in policy["steps"]
+            )
+            policies.append(
+                PolicyPathResult(
                 policy=policy["policy"],
                 complete=bool(policy["complete"]),
                 initial_value=float(policy["initial_value"]),
@@ -205,26 +287,21 @@ def path_run_result_from_dict(payload: dict[str, Any]) -> PathRunResult:
                 total_interaction_effect=float(policy["total_interaction_effect"]),
                 total_cash_flow_effect=float(policy["total_cash_flow_effect"]),
                 total_change=float(policy["total_change"]),
-                steps=tuple(
-                    PathStepResult(
-                        step_id=step["step_id"],
-                        scenario_id=step["scenario_id"],
-                        scenario_version=int(step["scenario_version"]),
-                        scenario_fingerprint=step["scenario_fingerprint"],
-                        market_effect=float(step["market_effect"]),
-                        trade_effect=float(step["trade_effect"]),
-                        interaction_effect=float(step["interaction_effect"]),
-                        cash_flow_effect=float(step["cash_flow_effect"]),
-                        total_change=float(step["total_change"]),
-                        portfolio_value=float(step["portfolio_value"]),
-                        contributions=tuple(
-                            Contribution(**entry) for entry in step["contributions"]
-                        ),
-                    )
-                    for step in policy["steps"]
+                steps=steps,
+                total_action_effect=float(policy.get("total_action_effect", 0.0)),
+                total_action_fees=float(policy.get("total_action_fees", 0.0)),
+                total_cash_flow_from_actions=float(
+                    policy.get("total_cash_flow_from_actions", 0.0)
                 ),
+                first_trigger_step_id=policy.get("first_trigger_step_id"),
+                first_breaches=tuple(
+                    LimitViolation(**entry) for entry in policy.get("first_breaches", ())
+                ),
+                unresolved_metrics=tuple(
+                    LimitViolation(**entry)
+                    for entry in policy.get("unresolved_metrics", ())
+                )
             )
-            for policy in item["policies"]
         )
         results.append(
             PathScenarioResult(
@@ -233,10 +310,41 @@ def path_run_result_from_dict(payload: dict[str, Any]) -> PathRunResult:
                 path_fingerprint=item["path_fingerprint"],
                 status=item["status"],
                 missing_data=item.get("missing_data"),
-                policies=policies,
+                policies=tuple(policies),
+                first_trigger_step_id=item.get("first_trigger_step_id"),
+                trigger_basis_fingerprint=item.get("trigger_basis_fingerprint"),
             )
         )
     return PathRunResult(run_id=payload["run_id"], results=tuple(results))
+
+
+def _action_reconciliation_from_dict(
+    value: dict[str, Any] | None,
+) -> ActionReconciliation | None:
+    if value is None:
+        return None
+    fills = tuple(
+        ActionFill(
+            type=fill["type"],
+            holding_id=fill.get("holding_id"),
+            quantity=float(fill["quantity"]),
+            from_currency=fill.get("from_currency"),
+            to_currency=fill.get("to_currency"),
+            local_amount=float(fill["local_amount"]),
+            base_gross_amount=float(fill["base_gross_amount"]),
+            fee_base_amount=float(fill["fee_base_amount"]),
+            base_net_amount=float(fill["base_net_amount"]),
+        )
+        for fill in value.get("fills", ())
+    )
+    return ActionReconciliation(
+        pre_action_value=float(value["pre_action_value"]),
+        post_action_value=float(value["post_action_value"]),
+        action_effect=float(value["action_effect"]),
+        fees=float(value["fees"]),
+        cash_flow_from_actions=float(value["cash_flow_from_actions"]),
+        fills=fills,
+    )
 
 
 def compare_path_results(
@@ -264,6 +372,10 @@ def compare_path_results(
                     "trade_effect": policy.total_trade_effect,
                     "interaction_effect": policy.total_interaction_effect,
                     "cash_flow_effect": policy.total_cash_flow_effect,
+                    "action_effect": policy.total_action_effect,
+                    "action_fees": policy.total_action_fees,
+                    "cash_flow_from_actions": policy.total_cash_flow_from_actions,
+                    "first_trigger_step_id": policy.first_trigger_step_id,
                 }
     return table
 

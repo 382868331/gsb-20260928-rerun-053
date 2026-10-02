@@ -62,14 +62,16 @@ class StressPathTests(unittest.TestCase):
                         step.market_effect
                         + step.trade_effect
                         + step.interaction_effect
-                        + step.cash_flow_effect,
+                        + step.cash_flow_effect
+                        + step.action_effect,
                         step.total_change,
                     )
                 self.assertAlmostEqual(
                     policy.total_market_effect
                     + policy.total_trade_effect
                     + policy.total_interaction_effect
-                    + policy.total_cash_flow_effect,
+                    + policy.total_cash_flow_effect
+                    + policy.total_action_effect,
                     policy.total_change,
                 )
                 self.assertAlmostEqual(
@@ -177,7 +179,16 @@ class StressPathTests(unittest.TestCase):
         columns = table["stagflation_ladder"]
         self.assertEqual(
             set(columns),
-            {"v1/hold", "v1/rebalance", "v2/hold", "v2/rebalance"},
+            {
+                "v1/hold",
+                "v1/rebalance",
+                "v1/action:sell_equity",
+                "v1/action:sell_and_buy_eur",
+                "v2/hold",
+                "v2/rebalance",
+                "v2/action:sell_equity",
+                "v2/action:sell_and_buy_eur",
+            },
         )
         for key, column in columns.items():
             self.assertEqual(column["status"], "complete")
@@ -185,7 +196,8 @@ class StressPathTests(unittest.TestCase):
                 column["market_effect"]
                 + column["trade_effect"]
                 + column["interaction_effect"]
-                + column["cash_flow_effect"],
+                + column["cash_flow_effect"]
+                + column["action_effect"],
                 column["total_change"],
             )
             self.assertAlmostEqual(
@@ -198,6 +210,116 @@ class StressPathTests(unittest.TestCase):
         )
         self.assertNotEqual(
             columns["v1/hold"]["fingerprint"], columns["v2/hold"]["fingerprint"]
+        )
+
+    def test_first_trigger_records_each_limit_and_independent_resolution(self) -> None:
+        path = make_path(
+            [
+                scenario("base", 50, 0.03, 7.1),
+                scenario("stress", 40, 0.03, 7.1),
+            ],
+        )
+        path["limits"] = {
+            "max_loss": 5000,
+            "currency_exposure": {"USD": 10000},
+            "asset_concentration": {"frog-equity": 0.07},
+        }
+        path["action_plans"] = [
+            {
+                "plan_id": "sell_ten",
+                "trigger_step_id": "t0",
+                "orders": [
+                    {"type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10}
+                ],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path_file = Path(directory) / "paths.json"
+            path_file.write_text(json.dumps({"paths": [path]}), encoding="utf-8")
+            loaded = load_paths(path_file)
+        result = self.engine.run("limits", self.holdings, loaded)
+        path_result = result.results[0]
+        self.assertEqual(path_result.first_trigger_step_id, "t0")
+        self.assertEqual(
+            path_result.trigger_basis_fingerprint, path_result.path_fingerprint
+        )
+        policies = {item.policy: item for item in path_result.policies}
+        hold = policies["hold"]
+        self.assertEqual(hold.first_trigger_step_id, "t0")
+        self.assertEqual(
+            {item.metric for item in hold.first_breaches},
+            {"currency_exposure:USD", "asset_concentration:frog-equity"},
+        )
+        sources = {item.metric: item.source for item in hold.first_breaches}
+        self.assertEqual(sources["currency_exposure:USD"], "currency:USD")
+        self.assertEqual(sources["asset_concentration:frog-equity"], "asset:frog-equity")
+        self.assertTrue(
+            all(
+                item.trigger_step_id == "t0"
+                for item in hold.first_breaches
+            )
+        )
+
+        sell_only = policies["action:sell_ten"]
+        unresolved_metrics = {item.metric for item in sell_only.unresolved_metrics}
+        self.assertIn("currency_exposure:USD", unresolved_metrics)
+        self.assertNotIn("asset_concentration:frog-equity", unresolved_metrics)
+
+    def test_action_costs_cash_flow_and_reconciliation_do_not_double_count(self) -> None:
+        result = self.engine.run("actions", self.holdings, self.paths)
+        policies = {
+            item.policy: item
+            for item in result.results[0].policies
+        }
+        sell_only = policies["action:sell_equity"]
+        sell_step = sell_only.steps[0]
+        self.assertAlmostEqual(sell_step.action_fees, 10 * 40 * 7.1 * 10 / 10000)
+        self.assertAlmostEqual(
+            sell_step.cash_flow_from_actions, 10 * 40 * 7.1
+        )
+        self.assertAlmostEqual(
+            sell_step.action_reconciliation.post_action_value
+            - sell_step.action_reconciliation.pre_action_value,
+            sell_step.action_reconciliation.action_effect,
+        )
+        self.assertAlmostEqual(sell_step.action_effect, -sell_step.action_fees)
+
+        hedge = policies["action:sell_and_buy_eur"]
+        hedge_step = hedge.steps[0]
+        self.assertEqual(len(hedge_step.action_reconciliation.fills), 2)
+        self.assertAlmostEqual(
+            hedge_step.cash_flow_from_actions, 10 * 40 * 7.1
+        )
+        self.assertAlmostEqual(hedge_step.action_effect, -hedge_step.action_fees)
+
+    def test_missing_future_data_keeps_confirmed_breach_and_unconfirmed_metrics(self) -> None:
+        good = scenario("a", 50, 0.03, 7.1)
+        breach = scenario("b", 40, 0.03, 7.1)
+        broken = scenario("c", 40, 0.03, 7.1)
+        broken["fx_rates"] = {}
+        path = make_path(
+            [good, breach, broken],
+            step_extras={
+                1: {
+                    "cash_flows": [{"currency": "USD", "amount": 0}],
+                }
+            },
+        )
+        path["limits"] = {
+            "max_loss": 100,
+            "currency_exposure": {"USD": 1000000},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path_file = Path(directory) / "paths.json"
+            path_file.write_text(json.dumps({"paths": [path]}), encoding="utf-8")
+            loaded = load_paths(path_file)
+            result = self.engine.run("partial-limits", self.holdings, loaded)
+        hold = result.results[0].policies[0]
+        self.assertEqual(hold.first_trigger_step_id, "t1")
+        self.assertEqual(hold.first_breaches[0].metric, "loss")
+        self.assertEqual(
+            {item.metric: item.status for item in hold.unresolved_metrics},
+            {"loss": "unconfirmed", "currency_exposure:USD": "unconfirmed"},
         )
 
     def test_result_store_round_trip(self) -> None:
@@ -233,6 +355,12 @@ class StressPathTests(unittest.TestCase):
             self.assertTrue(published.exists())
             payload = json.loads(published.read_text(encoding="utf-8"))
             self.assertEqual(payload["run_id"], "cli-paths-paths")
+            policies = [
+                policy["policy"]
+                for policy in payload["results"][0]["policies"]
+            ]
+            self.assertIn("action:sell_equity", policies)
+            self.assertIn("action:sell_and_buy_eur", policies)
 
 
 if __name__ == "__main__":

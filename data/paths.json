@@ -4,6 +4,28 @@
       "path_id": "stagflation_ladder",
       "version": 1,
       "description": "Equity slides first, then rates rise, then USD strengthens",
+      "limits": {
+        "max_loss": 1400,
+        "currency_exposure": {"USD": 25000},
+        "asset_concentration": {"frog-equity": 0.08}
+      },
+      "action_plans": [
+        {
+          "plan_id": "sell_equity",
+          "trigger_step_id": "t1_equity_slide",
+          "orders": [
+            {"type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10}
+          ]
+        },
+        {
+          "plan_id": "sell_and_buy_eur",
+          "trigger_step_id": "t1_equity_slide",
+          "orders": [
+            {"type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10},
+            {"type": "fx_conversion", "from_currency": "USD", "to_currency": "EUR", "from_amount": 400, "fee_bps": 20}
+          ]
+        }
+      ],
       "steps": [
         {
           "step_id": "t0",
@@ -58,6 +80,28 @@
       "path_id": "stagflation_ladder",
       "version": 2,
       "description": "Revised: FX shock arrives before the rates move",
+      "limits": {
+        "max_loss": 1400,
+        "currency_exposure": {"USD": 25000},
+        "asset_concentration": {"frog-equity": 0.08}
+      },
+      "action_plans": [
+        {
+          "plan_id": "sell_equity",
+          "trigger_step_id": "t1_equity_slide",
+          "orders": [
+            {"type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10}
+          ]
+        },
+        {
+          "plan_id": "sell_and_buy_eur",
+          "trigger_step_id": "t1_equity_slide",
+          "orders": [
+            {"type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10},
+            {"type": "fx_conversion", "from_currency": "USD", "to_currency": "EUR", "from_amount": 400, "fee_bps": 20}
+          ]
+        }
+      ],
       "steps": [
         {
           "step_id": "t0",
