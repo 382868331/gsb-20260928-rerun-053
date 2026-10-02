@@ -273,3 +273,234 @@ def load_path_run_result(directory: str | Path, run_id: str) -> PathRunResult:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     return path_run_result_from_dict(payload)
+
+
+@dataclass(frozen=True, slots=True)
+class LimitBreachRecord:
+    """One confirmed limit breach at one step, with its source."""
+
+    limit_id: str
+    metric: str
+    observed: float
+    threshold: float
+    sources: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerRecord:
+    """Immutable evidence of why and where a disposal plan fired.
+
+    Records the scenario version and fingerprint visible at the trigger
+    step, so the basis stays queryable even after later market scenarios
+    are revised.
+    """
+
+    plan_id: str
+    plan_version: int
+    limit_id: str
+    step_id: str
+    scenario_id: str
+    scenario_version: int
+    scenario_fingerprint: str
+    observed: float
+    threshold: float
+    sources: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LimitStepResult:
+    """One replay step under one disposal plan.
+
+    market_effect + cash_flow_effect + trade_effect + disposal_effect +
+    fee_effect equals total_change exactly; every component is valued at
+    the step's own market so the same trade is never counted twice.
+    """
+
+    step_id: str
+    scenario_id: str
+    scenario_version: int
+    scenario_fingerprint: str
+    market_effect: float
+    cash_flow_effect: float
+    trade_effect: float
+    disposal_effect: float
+    fee_effect: float
+    total_change: float
+    portfolio_value: float
+    breaches: tuple[LimitBreachRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DisposalReplayResult:
+    """Replay of one path under one disposal plan (or no_action baseline)."" """
+
+    plan_id: str
+    plan_version: int
+    plan_fingerprint: str
+    applied: bool
+    trigger: TriggerRecord | None
+    complete: bool
+    initial_value: float
+    final_value: float
+    total_market_effect: float
+    total_cash_flow_effect: float
+    total_trade_effect: float
+    total_disposal_effect: float
+    total_fee_effect: float
+    total_change: float
+    total_fees: float
+    unconfirmed_limits: tuple[str, ...]
+    steps: tuple[LimitStepResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LimitPathResult:
+    path_id: str
+    path_version: int
+    path_fingerprint: str
+    status: str
+    missing_data: str | None
+    first_breaches: tuple[TriggerRecord, ...]
+    unconfirmed_limits: tuple[str, ...]
+    plans: tuple[DisposalReplayResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LimitRunResult:
+    run_id: str
+    results: tuple[LimitPathResult, ...]
+
+    @property
+    def complete(self) -> bool:
+        return all(item.status == "complete" for item in self.results)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _breach_record_from_dict(payload: dict[str, Any]) -> LimitBreachRecord:
+    return LimitBreachRecord(
+        limit_id=payload["limit_id"],
+        metric=payload["metric"],
+        observed=float(payload["observed"]),
+        threshold=float(payload["threshold"]),
+        sources=tuple(dict(source) for source in payload.get("sources", ())),
+    )
+
+
+def _trigger_record_from_dict(payload: dict[str, Any]) -> TriggerRecord:
+    return TriggerRecord(
+        plan_id=payload["plan_id"],
+        plan_version=int(payload["plan_version"]),
+        limit_id=payload["limit_id"],
+        step_id=payload["step_id"],
+        scenario_id=payload["scenario_id"],
+        scenario_version=int(payload["scenario_version"]),
+        scenario_fingerprint=payload["scenario_fingerprint"],
+        observed=float(payload["observed"]),
+        threshold=float(payload["threshold"]),
+        sources=tuple(dict(source) for source in payload.get("sources", ())),
+    )
+
+
+def limit_run_result_from_dict(payload: dict[str, Any]) -> LimitRunResult:
+    results = []
+    for item in payload["results"]:
+        plans = []
+        for plan in item["plans"]:
+            trigger = plan.get("trigger")
+            plans.append(
+                DisposalReplayResult(
+                    plan_id=plan["plan_id"],
+                    plan_version=int(plan["plan_version"]),
+                    plan_fingerprint=plan["plan_fingerprint"],
+                    applied=bool(plan["applied"]),
+                    trigger=_trigger_record_from_dict(trigger) if trigger else None,
+                    complete=bool(plan["complete"]),
+                    initial_value=float(plan["initial_value"]),
+                    final_value=float(plan["final_value"]),
+                    total_market_effect=float(plan["total_market_effect"]),
+                    total_cash_flow_effect=float(plan["total_cash_flow_effect"]),
+                    total_trade_effect=float(plan["total_trade_effect"]),
+                    total_disposal_effect=float(plan["total_disposal_effect"]),
+                    total_fee_effect=float(plan["total_fee_effect"]),
+                    total_change=float(plan["total_change"]),
+                    total_fees=float(plan["total_fees"]),
+                    unconfirmed_limits=tuple(plan.get("unconfirmed_limits", ())),
+                    steps=tuple(
+                        LimitStepResult(
+                            step_id=step["step_id"],
+                            scenario_id=step["scenario_id"],
+                            scenario_version=int(step["scenario_version"]),
+                            scenario_fingerprint=step["scenario_fingerprint"],
+                            market_effect=float(step["market_effect"]),
+                            cash_flow_effect=float(step["cash_flow_effect"]),
+                            trade_effect=float(step["trade_effect"]),
+                            disposal_effect=float(step["disposal_effect"]),
+                            fee_effect=float(step["fee_effect"]),
+                            total_change=float(step["total_change"]),
+                            portfolio_value=float(step["portfolio_value"]),
+                            breaches=tuple(
+                                _breach_record_from_dict(entry)
+                                for entry in step.get("breaches", ())
+                            ),
+                        )
+                        for step in plan["steps"]
+                    ),
+                )
+            )
+        results.append(
+            LimitPathResult(
+                path_id=item["path_id"],
+                path_version=int(item["path_version"]),
+                path_fingerprint=item["path_fingerprint"],
+                status=item["status"],
+                missing_data=item.get("missing_data"),
+                first_breaches=tuple(
+                    _trigger_record_from_dict(entry)
+                    for entry in item.get("first_breaches", ())
+                ),
+                unconfirmed_limits=tuple(item.get("unconfirmed_limits", ())),
+                plans=tuple(plans),
+            )
+        )
+    return LimitRunResult(run_id=payload["run_id"], results=tuple(results))
+
+
+def load_limit_run_result(directory: str | Path, run_id: str) -> LimitRunResult:
+    path = ResultStore(directory).path_for(run_id)
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return limit_run_result_from_dict(payload)
+
+
+def compare_limit_results(
+    runs: list[LimitRunResult],
+) -> dict[str, dict[str, dict[str, float | str | bool | None]]]:
+    """Side-by-side table keyed by path_id, then "<path vN>/<plan_id>@v<plan ver>".
+
+    The no_action baseline and every disposal plan version appear next to
+    each other so risk, fees and cash effects can be reconciled per column.
+    """
+    table: dict[str, dict[str, dict[str, float | str | bool | None]]] = {}
+    for run in runs:
+        for result in run.results:
+            columns = table.setdefault(result.path_id, {})
+            for plan in result.plans:
+                key = f"v{result.path_version}/{plan.plan_id}@v{plan.plan_version}"
+                columns[key] = {
+                    "run_id": run.run_id,
+                    "status": result.status,
+                    "applied": plan.applied,
+                    "trigger_step": plan.trigger.step_id if plan.trigger else None,
+                    "initial_value": plan.initial_value,
+                    "final_value": plan.final_value,
+                    "total_change": plan.total_change,
+                    "market_effect": plan.total_market_effect,
+                    "cash_flow_effect": plan.total_cash_flow_effect,
+                    "trade_effect": plan.total_trade_effect,
+                    "disposal_effect": plan.total_disposal_effect,
+                    "fee_effect": plan.total_fee_effect,
+                    "total_fees": plan.total_fees,
+                }
+    return table

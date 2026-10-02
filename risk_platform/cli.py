@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import uuid
 
+from risk_platform.disposal import load_disposal_plans
 from risk_platform.engine import RevaluationEngine
 from risk_platform.holdings import load_holdings
+from risk_platform.limit_engine import LimitPathEngine
+from risk_platform.limits import load_limits
 from risk_platform.path_engine import DEFAULT_POLICIES, PathEngine
 from risk_platform.paths import load_paths
 from risk_platform.results import ResultStore
@@ -16,6 +19,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--holdings", required=True)
     parser.add_argument("--scenarios")
     parser.add_argument("--paths", help="Ordered multi-step stress paths JSON")
+    parser.add_argument("--limits", help="Portfolio risk limits JSON (requires --paths)")
+    parser.add_argument("--disposals", help="Disposal plans JSON (requires --limits)")
     parser.add_argument(
         "--policies",
         default=",".join(DEFAULT_POLICIES),
@@ -31,6 +36,10 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if not args.scenarios and not args.paths:
         raise SystemExit("At least one of --scenarios or --paths is required")
+    if args.disposals and not args.limits:
+        raise SystemExit("--disposals requires --limits")
+    if args.limits and not args.paths:
+        raise SystemExit("--limits requires --paths")
     holdings = load_holdings(args.holdings)
     store = ResultStore(args.results_dir)
 
@@ -56,6 +65,20 @@ def main(argv: list[str] | None = None) -> None:
         print(store.save(path_result))
         if not path_result.complete:
             print("warning: incomplete path replay; partial results only")
+
+    if args.limits:
+        limits = load_limits(args.limits)
+        plans = load_disposal_plans(args.disposals) if args.disposals else []
+        limit_result = LimitPathEngine.default().run(
+            run_id=f"{args.run_id}-limits",
+            holdings=holdings,
+            paths=paths,
+            limits=limits,
+            plans=plans,
+        )
+        print(store.save(limit_result))
+        if not limit_result.complete:
+            print("warning: incomplete limit replay; confirmed breaches kept, remainder unconfirmed")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,23 @@
+{
+  "plans": [
+    {
+      "plan_id": "sell-equity",
+      "version": 1,
+      "trigger_limit_id": "loss-cap",
+      "description": "Sell half the equity position when the loss cap is hit",
+      "actions": [
+        {"action": "sell", "holding_id": "frog-equity", "fraction": 0.5, "fee_rate": 0.001}
+      ]
+    },
+    {
+      "plan_id": "sell-and-convert",
+      "version": 1,
+      "trigger_limit_id": "loss-cap",
+      "description": "Sell all equity and move part of the USD cash into EUR",
+      "actions": [
+        {"action": "sell", "holding_id": "frog-equity", "fraction": 1.0, "fee_rate": 0.001},
+        {"action": "fx_convert", "from_currency": "USD", "to_currency": "EUR", "amount": 500, "fee_rate": 0.0005}
+      ]
+    }
+  ]
+}

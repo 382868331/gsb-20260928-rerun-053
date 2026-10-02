@@ -1,0 +1,20 @@
+{
+  "limits": [
+    {
+      "limit_id": "loss-cap",
+      "metric": "loss",
+      "threshold": 1000
+    },
+    {
+      "limit_id": "usd-exposure-cap",
+      "metric": "currency_exposure",
+      "currency": "USD",
+      "threshold": 15000
+    },
+    {
+      "limit_id": "concentration-cap",
+      "metric": "concentration",
+      "threshold": 0.75
+    }
+  ]
+}
