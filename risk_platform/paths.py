@@ -44,6 +44,90 @@ class Trade:
 
 
 @dataclass(frozen=True, slots=True)
+class LiquidityWindow:
+    """Manually specified executable liquidity at one path step.
+
+    A sell window caps how many units of one holding can be filled in the
+    period and fixes the executable local-price band plus the settlement lag
+    (in path steps) before sale proceeds become available cash. An FX window
+    does the same for a FROM/TO currency pair, with the rate quoted as units
+    of TO currency per unit of FROM currency.
+    """
+
+    window_type: str
+    holding_id: str | None
+    pair: str | None
+    max_quantity: float
+    min_price: float
+    max_price: float
+    settlement_lag_steps: int
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LiquidityWindow":
+        window_type = str(data.get("type", "")).lower()
+        required = ("max_quantity", "min_price", "max_price", "settlement_lag_steps")
+        missing = [key for key in required if key not in data]
+        if missing:
+            raise ValueError(f"Liquidity window is missing fields: {', '.join(missing)}")
+        max_quantity = float(data["max_quantity"])
+        min_price = float(data["min_price"])
+        max_price = float(data["max_price"])
+        lag = int(data["settlement_lag_steps"])
+        if max_quantity < 0:
+            raise ValueError("Liquidity window max_quantity must not be negative")
+        if min_price <= 0 or max_price <= 0 or min_price > max_price:
+            raise ValueError("Liquidity window requires 0 < min_price <= max_price")
+        if lag < 0:
+            raise ValueError("settlement_lag_steps must not be negative")
+        if window_type == "sell":
+            if "holding_id" not in data:
+                raise ValueError("Sell liquidity window requires holding_id")
+            return cls(
+                window_type=window_type,
+                holding_id=str(data["holding_id"]),
+                pair=None,
+                max_quantity=max_quantity,
+                min_price=min_price,
+                max_price=max_price,
+                settlement_lag_steps=lag,
+            )
+        if window_type == "fx":
+            if "pair" not in data:
+                raise ValueError("FX liquidity window requires pair FROM/TO")
+            pair = str(data["pair"]).upper()
+            if len(pair.split("/")) != 2:
+                raise ValueError("FX liquidity window pair must look like USD/EUR")
+            return cls(
+                window_type=window_type,
+                holding_id=None,
+                pair=pair,
+                max_quantity=max_quantity,
+                min_price=min_price,
+                max_price=max_price,
+                settlement_lag_steps=lag,
+            )
+        raise ValueError(f"Unsupported liquidity window type: {window_type}")
+
+    @property
+    def pair_currencies(self) -> tuple[str, str]:
+        assert self.pair is not None
+        from_currency, to_currency = self.pair.split("/")
+        return from_currency, to_currency
+
+    def canonical_dict(self) -> dict[str, Any]:
+        key = "holding_id" if self.window_type == "sell" else "pair"
+        value = self.holding_id if self.window_type == "sell" else self.pair
+        return {
+            "type": self.window_type,
+            key: value,
+            "max_quantity": self.max_quantity,
+            "min_price": self.min_price,
+            "max_price": self.max_price,
+            "settlement_lag_steps": self.settlement_lag_steps,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RiskLimits:
     max_loss: float | None
     currency_exposure: dict[str, float]
@@ -99,6 +183,7 @@ class ActionOrder:
     from_currency: str | None = None
     to_currency: str | None = None
     from_amount: float | None = None
+    priority: int = 0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ActionOrder":
@@ -119,6 +204,7 @@ class ActionOrder:
                 fee_bps=fee_bps,
                 holding_id=str(data["holding_id"]),
                 quantity=quantity,
+                priority=int(data.get("priority", 0)),
             )
         if order_type == "fx_conversion":
             required = ("from_currency", "to_currency", "from_amount")
@@ -134,6 +220,7 @@ class ActionOrder:
                 from_currency=str(data["from_currency"]).upper(),
                 to_currency=str(data["to_currency"]).upper(),
                 from_amount=from_amount,
+                priority=int(data.get("priority", 0)),
             )
         raise ValueError(f"Unsupported action type: {order_type}")
 
@@ -144,6 +231,7 @@ class ActionOrder:
                 "holding_id": self.holding_id,
                 "quantity": self.quantity,
                 "fee_bps": self.fee_bps,
+                "priority": self.priority,
             }
         return {
             "type": self.order_type,
@@ -151,6 +239,7 @@ class ActionOrder:
             "to_currency": self.to_currency,
             "from_amount": self.from_amount,
             "fee_bps": self.fee_bps,
+            "priority": self.priority,
         }
 
 
@@ -159,6 +248,9 @@ class ActionPlan:
     plan_id: str
     trigger_step_id: str
     orders: tuple[ActionOrder, ...]
+    allocation_rule: str = "priority"
+    price_policy: str = "worst"
+    cancel_plan_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ActionPlan":
@@ -169,10 +261,22 @@ class ActionPlan:
         orders = tuple(ActionOrder.from_dict(item) for item in data["orders"])
         if not orders:
             raise ValueError("Action plan requires at least one order")
+        allocation_rule = str(data.get("allocation_rule", "priority")).lower()
+        if allocation_rule not in {"priority", "pro_rata"}:
+            raise ValueError("allocation_rule must be 'priority' or 'pro_rata'")
+        price_policy = str(data.get("price_policy", "worst")).lower()
+        if price_policy not in {"worst", "best", "midpoint"}:
+            raise ValueError("price_policy must be one of worst, best, midpoint")
+        cancel_plan_ids = tuple(
+            str(item) for item in data.get("cancel_plan_ids", ())
+        )
         return cls(
             plan_id=str(data["plan_id"]),
             trigger_step_id=str(data["trigger_step_id"]),
             orders=orders,
+            allocation_rule=allocation_rule,
+            price_policy=price_policy,
+            cancel_plan_ids=cancel_plan_ids,
         )
 
     def canonical_dict(self) -> dict[str, Any]:
@@ -180,6 +284,9 @@ class ActionPlan:
             "plan_id": self.plan_id,
             "trigger_step_id": self.trigger_step_id,
             "orders": [order.canonical_dict() for order in self.orders],
+            "allocation_rule": self.allocation_rule,
+            "price_policy": self.price_policy,
+            "cancel_plan_ids": list(self.cancel_plan_ids),
         }
 
 
@@ -189,6 +296,8 @@ class PathStep:
     scenario: MarketScenario
     cash_flows: tuple[CashFlow, ...]
     trades: tuple[Trade, ...]
+    liquidity_windows: tuple[LiquidityWindow, ...] = ()
+    cancel_plan_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PathStep":
@@ -201,6 +310,13 @@ class PathStep:
                 CashFlow.from_dict(item) for item in data.get("cash_flows", ())
             ),
             trades=tuple(Trade.from_dict(item) for item in data.get("trades", ())),
+            liquidity_windows=tuple(
+                LiquidityWindow.from_dict(item)
+                for item in data.get("liquidity_windows", ())
+            ),
+            cancel_plan_ids=tuple(
+                str(item) for item in data.get("cancel_plan_ids", ())
+            ),
         )
 
     def canonical_dict(self) -> dict[str, Any]:
@@ -209,6 +325,8 @@ class PathStep:
             "scenario": self.scenario.canonical_dict(),
             "cash_flows": [item.canonical_dict() for item in self.cash_flows],
             "trades": [item.canonical_dict() for item in self.trades],
+            "liquidity_windows": [w.canonical_dict() for w in self.liquidity_windows],
+            "cancel_plan_ids": list(self.cancel_plan_ids),
         }
 
 
@@ -312,6 +430,30 @@ class StressPath:
                         f"Path {self.path_id} step {step.step_id} trades unknown "
                         f"holding {trade.holding_id}"
                     )
+            for window in step.liquidity_windows:
+                if window.window_type == "sell":
+                    assert window.holding_id is not None
+                    if window.holding_id not in holding_ids:
+                        raise ValueError(
+                            f"Path {self.path_id} step {step.step_id} liquidity window "
+                            f"references unknown holding {window.holding_id}"
+                        )
+                    if holding_by_id[window.holding_id].asset_type == "cash":
+                        raise ValueError(
+                            f"Path {self.path_id} step {step.step_id} liquidity window "
+                            f"cannot trade cash holding {window.holding_id}"
+                        )
+                else:
+                    from_currency, to_currency = window.pair_currencies
+                    currencies.update((from_currency, to_currency))
+            for cancelled in step.cancel_plan_ids:
+                if cancelled not in {
+                    plan.plan_id for plan in self.action_plans
+                }:
+                    raise ValueError(
+                        f"Path {self.path_id} step {step.step_id} cancels unknown "
+                        f"action plan {cancelled}"
+                    )
         for plan in self.action_plans:
             for order in plan.orders:
                 if order.order_type == "sell":
@@ -330,6 +472,13 @@ class StressPath:
                         currency
                         for currency in (order.from_currency, order.to_currency)
                         if currency is not None
+                    )
+            for cancelled in plan.cancel_plan_ids:
+                if cancelled not in {
+                    other.plan_id for other in self.action_plans
+                }:
+                    raise ValueError(
+                        f"Action plan {plan.plan_id} cancels unknown plan {cancelled}"
                     )
         unknown_currency_limits = sorted(
             set(self.limits.currency_exposure) - currencies

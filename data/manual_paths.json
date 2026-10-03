@@ -1,0 +1,100 @@
+{
+  "paths": [
+    {
+      "path_id": "manual_illiquid",
+      "version": 1,
+      "description": "Manual market: thin equity liquidity and delayed FX settlement",
+      "limits": {
+        "max_loss": 1400,
+        "currency_exposure": {"USD": 25000},
+        "asset_concentration": {"frog-equity": 0.08}
+      },
+      "action_plans": [
+        {
+          "plan_id": "de_risk",
+          "trigger_step_id": "t1_equity_slide",
+          "allocation_rule": "priority",
+          "price_policy": "worst",
+          "orders": [
+            {"type": "sell", "holding_id": "frog-equity", "quantity": 12, "fee_bps": 10, "priority": 1},
+            {"type": "fx_conversion", "from_currency": "USD", "to_currency": "EUR", "from_amount": 500, "fee_bps": 20, "priority": 2}
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "step_id": "t0",
+          "scenario": {
+            "scenario_id": "manual_t0",
+            "version": 1,
+            "description": "Initial snapshot",
+            "equity_prices": {"FROG": 50},
+            "bond_yields": {"FROG-BOND-1Y": 0.03},
+            "fx_rates": {"USD": 7.1, "EUR": 7.8}
+          }
+        },
+        {
+          "step_id": "t1_equity_slide",
+          "scenario": {
+            "scenario_id": "manual_t1",
+            "version": 1,
+            "description": "Equity down 20%, thin market",
+            "equity_prices": {"FROG": 40},
+            "bond_yields": {"FROG-BOND-1Y": 0.03},
+            "fx_rates": {"USD": 7.1, "EUR": 7.8}
+          },
+          "cash_flows": [{"currency": "USD", "amount": 200}],
+          "liquidity_windows": [
+            {"type": "sell", "holding_id": "frog-equity", "max_quantity": 4, "min_price": 38, "max_price": 39, "settlement_lag_steps": 2},
+            {"type": "fx", "pair": "USD/EUR", "max_quantity": 300, "min_price": 0.9, "max_price": 0.92, "settlement_lag_steps": 1}
+          ]
+        },
+        {
+          "step_id": "t2_rates_up",
+          "scenario": {
+            "scenario_id": "manual_t2",
+            "version": 1,
+            "description": "Rates up, a little more equity liquidity",
+            "equity_prices": {"FROG": 36},
+            "bond_yields": {"FROG-BOND-1Y": 0.04},
+            "fx_rates": {"USD": 7.1, "EUR": 7.8}
+          },
+          "liquidity_windows": [
+            {"type": "sell", "holding_id": "frog-equity", "max_quantity": 5, "min_price": 35, "max_price": 36, "settlement_lag_steps": 1},
+            {"type": "fx", "pair": "USD/EUR", "max_quantity": 200, "min_price": 0.9, "max_price": 0.92, "settlement_lag_steps": 1}
+          ]
+        },
+        {
+          "step_id": "t3_fx_shock",
+          "scenario": {
+            "scenario_id": "manual_t3",
+            "version": 1,
+            "description": "USD strengthens; first equity sale settles here",
+            "equity_prices": {"FROG": 36},
+            "bond_yields": {"FROG-BOND-1Y": 0.04},
+            "fx_rates": {"USD": 7.3, "EUR": 7.5}
+          },
+          "liquidity_windows": [
+            {"type": "sell", "holding_id": "frog-equity", "max_quantity": 8, "min_price": 35, "max_price": 36, "settlement_lag_steps": 0},
+            {"type": "fx", "pair": "USD/EUR", "max_quantity": 500, "min_price": 0.96, "max_price": 0.98, "settlement_lag_steps": 0}
+          ]
+        },
+        {
+          "step_id": "t4_settled",
+          "scenario": {
+            "scenario_id": "manual_t4",
+            "version": 1,
+            "description": "All lagged proceeds available",
+            "equity_prices": {"FROG": 34},
+            "bond_yields": {"FROG-BOND-1Y": 0.04},
+            "fx_rates": {"USD": 7.3, "EUR": 7.5}
+          },
+          "liquidity_windows": [
+            {"type": "sell", "holding_id": "frog-equity", "max_quantity": 20, "min_price": 33, "max_price": 34, "settlement_lag_steps": 0},
+            {"type": "fx", "pair": "USD/EUR", "max_quantity": 1000, "min_price": 0.96, "max_price": 0.98, "settlement_lag_steps": 0}
+          ]
+        }
+      ]
+    }
+  ]
+}

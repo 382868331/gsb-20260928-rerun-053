@@ -156,6 +156,11 @@ class PathStepResult:
     action_fees: float = 0.0
     cash_flow_from_actions: float = 0.0
     action_reconciliation: "ActionReconciliation | None" = None
+    pending_settle_base_amount: float = 0.0
+    pending_settle_entries: tuple["PendingSettlement", ...] = ()
+    available_cash_base: float = 0.0
+    residual_orders: tuple["ResidualOrder", ...] = ()
+    settled_from_fills_base: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +187,89 @@ class ActionFill:
     base_gross_amount: float
     fee_base_amount: float
     base_net_amount: float
+    order_id: str | None = None
+    requested_quantity: float | None = None
+    unit_price: float | None = None
+    trigger_step_id: str | None = None
+    fill_step_id: str | None = None
+    settlement_step_id: str | None = None
+    settlement_status: str = "settled"
+
+
+@dataclass(frozen=True, slots=True)
+class PendingSettlement:
+    """Proceeds from an executed fill that are not yet available cash."""
+
+    type: str
+    holding_id: str | None
+    currency: str
+    local_amount: float
+    base_amount: float
+    gross_base_amount: float
+    fee_base_amount: float
+    fill_step_id: str
+    settlement_step_id: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PendingSettlement":
+        return cls(
+            type=data["type"],
+            holding_id=data.get("holding_id"),
+            currency=data["currency"],
+            local_amount=float(data["local_amount"]),
+            base_amount=float(data["base_amount"]),
+            gross_base_amount=float(data["gross_base_amount"]),
+            fee_base_amount=float(data["fee_base_amount"]),
+            fill_step_id=data["fill_step_id"],
+            settlement_step_id=data["settlement_step_id"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ResidualOrder:
+    """A submitted instruction that has not been fully filled yet."""
+
+    order_id: str
+    type: str
+    holding_id: str | None
+    from_currency: str | None
+    to_currency: str | None
+    requested_quantity: float
+    filled_quantity: float
+    remaining_quantity: float
+    fee_bps: float
+    trigger_step_id: str
+    cancelled: bool = False
+    cancel_step_id: str | None = None
+    priority: int = 0
+    allocation_rule: str = "priority"
+    price_policy: str = "worst"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ResidualOrder":
+        return cls(
+            order_id=data["order_id"],
+            type=data["type"],
+            holding_id=data.get("holding_id"),
+            from_currency=data.get("from_currency"),
+            to_currency=data.get("to_currency"),
+            requested_quantity=float(data["requested_quantity"]),
+            filled_quantity=float(data["filled_quantity"]),
+            remaining_quantity=float(data["remaining_quantity"]),
+            fee_bps=float(data["fee_bps"]),
+            trigger_step_id=data["trigger_step_id"],
+            cancelled=bool(data.get("cancelled", False)),
+            cancel_step_id=data.get("cancel_step_id"),
+            priority=int(data.get("priority", 0)),
+            allocation_rule=data.get("allocation_rule", "priority"),
+            price_policy=data.get("price_policy", "worst"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +280,11 @@ class ActionReconciliation:
     fees: float
     cash_flow_from_actions: float
     fills: tuple[ActionFill, ...]
+    requested_value: float = 0.0
+    unfilled_value: float = 0.0
+    pending_base_value: float = 0.0
+    residual_orders: tuple[ResidualOrder, ...] = ()
+    cancelled_order_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +307,31 @@ class PolicyPathResult:
     first_trigger_step_id: str | None = None
     first_breaches: tuple[LimitViolation, ...] = ()
     unresolved_metrics: tuple[LimitViolation, ...] = ()
+    final_pending_settle: tuple["PendingSettlement", ...] = ()
+    final_residual_orders: tuple["ResidualOrder", ...] = ()
+    total_settlement_lag_effect: float = 0.0
+    resume_state: "PolicyResumeState | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyResumeState:
+    """Everything needed to reopen a partial-fill replay and continue."""
+
+    path_id: str
+    path_version: int
+    path_fingerprint: str
+    policy: str
+    completed_step_ids: tuple[str, ...]
+    quantities: dict[str, float]
+    cash: dict[str, float]
+    pending: tuple[PendingSettlement, ...]
+    residual_orders: tuple[ResidualOrder, ...]
+    initial_value: float
+    previous_total: float
+    external_cash_base: float
+    action_executed: bool
+    first_trigger_step_id: str | None
+    first_breaches: tuple[LimitViolation, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +391,21 @@ def path_run_result_from_dict(payload: dict[str, Any]) -> PathRunResult:
                     action_reconciliation=_action_reconciliation_from_dict(
                         step.get("action_reconciliation")
                     ),
+                    pending_settle_base_amount=float(
+                        step.get("pending_settle_base_amount", 0.0)
+                    ),
+                    pending_settle_entries=tuple(
+                        PendingSettlement.from_dict(entry)
+                        for entry in step.get("pending_settle_entries", ())
+                    ),
+                    available_cash_base=float(step.get("available_cash_base", 0.0)),
+                    residual_orders=tuple(
+                        ResidualOrder.from_dict(entry)
+                        for entry in step.get("residual_orders", ())
+                    ),
+                    settled_from_fills_base=float(
+                        step.get("settled_from_fills_base", 0.0)
+                    ),
                 )
                 for step in policy["steps"]
             )
@@ -300,7 +433,19 @@ def path_run_result_from_dict(payload: dict[str, Any]) -> PathRunResult:
                 unresolved_metrics=tuple(
                     LimitViolation(**entry)
                     for entry in policy.get("unresolved_metrics", ())
-                )
+                ),
+                final_pending_settle=tuple(
+                    PendingSettlement.from_dict(entry)
+                    for entry in policy.get("final_pending_settle", ())
+                ),
+                final_residual_orders=tuple(
+                    ResidualOrder.from_dict(entry)
+                    for entry in policy.get("final_residual_orders", ())
+                ),
+                total_settlement_lag_effect=float(
+                    policy.get("total_settlement_lag_effect", 0.0)
+                ),
+                resume_state=_resume_state_from_dict(policy.get("resume_state")),
             )
         )
         results.append(
@@ -324,19 +469,34 @@ def _action_reconciliation_from_dict(
     if value is None:
         return None
     fills = tuple(
-        ActionFill(
-            type=fill["type"],
-            holding_id=fill.get("holding_id"),
-            quantity=float(fill["quantity"]),
-            from_currency=fill.get("from_currency"),
-            to_currency=fill.get("to_currency"),
-            local_amount=float(fill["local_amount"]),
-            base_gross_amount=float(fill["base_gross_amount"]),
-            fee_base_amount=float(fill["fee_base_amount"]),
-            base_net_amount=float(fill["base_net_amount"]),
+            ActionFill(
+                type=fill["type"],
+                holding_id=fill.get("holding_id"),
+                quantity=float(fill["quantity"]),
+                from_currency=fill.get("from_currency"),
+                to_currency=fill.get("to_currency"),
+                local_amount=float(fill["local_amount"]),
+                base_gross_amount=float(fill["base_gross_amount"]),
+                fee_base_amount=float(fill["fee_base_amount"]),
+                base_net_amount=float(fill["base_net_amount"]),
+                order_id=fill.get("order_id"),
+                requested_quantity=(
+                    float(fill["requested_quantity"])
+                    if fill.get("requested_quantity") is not None
+                    else None
+                ),
+                unit_price=(
+                    float(fill["unit_price"])
+                    if fill.get("unit_price") is not None
+                    else None
+                ),
+                trigger_step_id=fill.get("trigger_step_id"),
+                fill_step_id=fill.get("fill_step_id"),
+                settlement_step_id=fill.get("settlement_step_id"),
+                settlement_status=fill.get("settlement_status", "settled"),
+            )
+            for fill in value.get("fills", ())
         )
-        for fill in value.get("fills", ())
-    )
     return ActionReconciliation(
         pre_action_value=float(value["pre_action_value"]),
         post_action_value=float(value["post_action_value"]),
@@ -344,6 +504,42 @@ def _action_reconciliation_from_dict(
         fees=float(value["fees"]),
         cash_flow_from_actions=float(value["cash_flow_from_actions"]),
         fills=fills,
+        requested_value=float(value.get("requested_value", 0.0)),
+        unfilled_value=float(value.get("unfilled_value", 0.0)),
+        pending_base_value=float(value.get("pending_base_value", 0.0)),
+        residual_orders=tuple(
+            ResidualOrder.from_dict(entry)
+            for entry in value.get("residual_orders", ())
+        ),
+        cancelled_order_ids=tuple(value.get("cancelled_order_ids", ())),
+    )
+
+
+def _resume_state_from_dict(
+    value: dict[str, Any] | None,
+) -> PolicyResumeState | None:
+    if value is None:
+        return None
+    return PolicyResumeState(
+        path_id=value["path_id"],
+        path_version=int(value["path_version"]),
+        path_fingerprint=value["path_fingerprint"],
+        policy=value["policy"],
+        completed_step_ids=tuple(value["completed_step_ids"]),
+        quantities={key: float(amount) for key, amount in value["quantities"].items()},
+        cash={key: float(amount) for key, amount in value["cash"].items()},
+        pending=tuple(PendingSettlement.from_dict(item) for item in value.get("pending", ())),
+        residual_orders=tuple(
+            ResidualOrder.from_dict(item) for item in value.get("residual_orders", ())
+        ),
+        initial_value=float(value["initial_value"]),
+        previous_total=float(value["previous_total"]),
+        external_cash_base=float(value["external_cash_base"]),
+        action_executed=bool(value["action_executed"]),
+        first_trigger_step_id=value.get("first_trigger_step_id"),
+        first_breaches=tuple(
+            LimitViolation(**entry) for entry in value.get("first_breaches", ())
+        ),
     )
 
 
@@ -385,3 +581,80 @@ def load_path_run_result(directory: str | Path, run_id: str) -> PathRunResult:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     return path_run_result_from_dict(payload)
+
+
+def compare_disposal_policies(
+    result: PathScenarioResult,
+    instant_policy: str,
+    constrained_policy: str,
+) -> dict[str, Any]:
+    """Attribute constrained-vs-instant disposal differences to drivers.
+
+    Reports each driver the requirements call out separately: unfilled
+    quantity, the manually fixed executable price band, one-time fees (no
+    double counting on partial fills), and proceeds already executed but not
+    yet available because of settlement lag.
+    """
+    policies = {item.policy: item for item in result.policies}
+    hold = policies["hold"]
+    instant = policies[instant_policy]
+    constrained = policies[constrained_policy]
+
+    instant_fills = [
+        fill
+        for step in instant.steps
+        if step.action_reconciliation
+        for fill in step.action_reconciliation.fills
+    ]
+
+    price_band_effect = 0.0
+    for step in constrained.steps:
+        if not step.action_reconciliation:
+            continue
+        for fill in step.action_reconciliation.fills:
+            if fill.unit_price is None or fill.type != "sell":
+                continue
+            matching = next(
+                (
+                    other
+                    for other in instant_fills
+                    if other.type == fill.type
+                    and other.holding_id == fill.holding_id
+                ),
+                None,
+            )
+            if matching is None or matching.local_amount <= 0:
+                continue
+            instant_unit_base = matching.base_gross_amount / matching.quantity
+            price_band_effect += fill.base_gross_amount - fill.quantity * instant_unit_base
+
+    unfilled_value = sum(
+        step.action_reconciliation.unfilled_value
+        for step in constrained.steps
+        if step.action_reconciliation
+    )
+    pending_base = sum(entry.base_amount for entry in constrained.final_pending_settle)
+    fee_difference = instant.total_action_fees - constrained.total_action_fees
+    final_gap = constrained.final_value - instant.final_value
+    return {
+        "path_id": result.path_id,
+        "path_version": result.path_version,
+        "hold_final_value": hold.final_value,
+        "instant_final_value": instant.final_value,
+        "constrained_final_value": constrained.final_value,
+        "instant_vs_hold": instant.final_value - hold.final_value,
+        "constrained_vs_hold": constrained.final_value - hold.final_value,
+        "constrained_vs_instant": final_gap,
+        "fill_shortfall_base": unfilled_value,
+        "price_band_base": price_band_effect,
+        "instant_fees_base": instant.total_action_fees,
+        "constrained_fees_base": constrained.total_action_fees,
+        "fee_difference_base": fee_difference,
+        "settlement_lag_pending_base": pending_base,
+        "residual_unexplained_base": (
+            final_gap
+            - price_band_effect
+            + constrained.total_action_fees
+            - instant.total_action_fees
+        ),
+    }
