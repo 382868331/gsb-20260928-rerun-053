@@ -8,6 +8,7 @@ from risk_platform.holdings import load_holdings
 from risk_platform.path_engine import PathEngine
 from risk_platform.paths import load_paths
 from risk_platform.results import ResultStore
+from risk_platform.results import load_path_run_result
 from risk_platform.scenarios import load_scenarios
 
 
@@ -23,6 +24,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--results-dir", required=True)
     parser.add_argument("--run-id", default=f"run-{uuid.uuid4().hex[:12]}")
     parser.add_argument("--base-scenario-id", default="base")
+    parser.add_argument(
+        "--resume-from",
+        help="Run id of a previously saved partial/fill-state path run",
+    )
     return parser
 
 
@@ -50,12 +55,22 @@ def main(argv: list[str] | None = None) -> None:
             if args.policies is None
             else tuple(item.strip() for item in args.policies.split(",") if item.strip())
         )
-        path_result = PathEngine.default().run(
-            run_id=f"{args.run_id}-paths",
-            holdings=holdings,
-            paths=paths,
-            policies=policies,
-        )
+        engine = PathEngine.default()
+        if args.resume_from:
+            previous = load_path_run_result(args.results_dir, args.resume_from)
+            path_result = engine.resume(
+                run_id=f"{args.run_id}-paths",
+                holdings=holdings,
+                paths=paths,
+                previous=previous,
+            )
+        else:
+            path_result = engine.run(
+                run_id=f"{args.run_id}-paths",
+                holdings=holdings,
+                paths=paths,
+                policies=policies,
+            )
         print(store.save(path_result))
         if not path_result.complete:
             print("warning: incomplete path replay; partial results only")

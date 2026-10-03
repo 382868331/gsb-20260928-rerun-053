@@ -14,15 +14,15 @@
           "plan_id": "sell_equity",
           "trigger_step_id": "t1_equity_slide",
           "orders": [
-            {"type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10}
+            {"order_id": "sell1", "type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10}
           ]
         },
         {
           "plan_id": "sell_and_buy_eur",
           "trigger_step_id": "t1_equity_slide",
           "orders": [
-            {"type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10},
-            {"type": "fx_conversion", "from_currency": "USD", "to_currency": "EUR", "from_amount": 400, "fee_bps": 20}
+            {"order_id": "sell1", "type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10},
+            {"order_id": "fx1", "type": "fx_conversion", "from_currency": "USD", "to_currency": "EUR", "from_amount": 400, "fee_bps": 20}
           ]
         }
       ],
@@ -49,7 +49,11 @@
             "fx_rates": {"USD": 7.1, "EUR": 7.8}
           },
           "cash_flows": [{"currency": "USD", "amount": 200}],
-          "trades": [{"holding_id": "frog-equity", "quantity_delta": -5}]
+          "trades": [{"holding_id": "frog-equity", "quantity_delta": -5}],
+          "fill_windows": [
+            {"kind": "sell", "key": "frog-equity", "capacity": 4, "price_low": 39, "price_high": 40, "settlement_steps": 1},
+            {"kind": "fx", "key": "USD->EUR", "capacity": 260, "price_low": 0.90, "price_high": 0.91, "settlement_steps": 1}
+          ]
         },
         {
           "step_id": "t2_rates_up",
@@ -59,8 +63,10 @@
             "description": "Rates up 100bp",
             "equity_prices": {"FROG": 40},
             "bond_yields": {"FROG-BOND-1Y": 0.04},
-            "fx_rates": {"USD": 7.1, "EUR": 7.8}
+          "fx_rates": {"USD": 7.1, "EUR": 7.8}
           }
+          ,
+          "cancellations": [{"plan_id": "sell_and_buy_eur"}]
         },
         {
           "step_id": "t3_fx_shock",
@@ -90,15 +96,15 @@
           "plan_id": "sell_equity",
           "trigger_step_id": "t1_equity_slide",
           "orders": [
-            {"type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10}
+            {"order_id": "sell1", "type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10}
           ]
         },
         {
           "plan_id": "sell_and_buy_eur",
           "trigger_step_id": "t1_equity_slide",
           "orders": [
-            {"type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10},
-            {"type": "fx_conversion", "from_currency": "USD", "to_currency": "EUR", "from_amount": 400, "fee_bps": 20}
+            {"order_id": "sell1", "type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10},
+            {"order_id": "fx1", "type": "fx_conversion", "from_currency": "USD", "to_currency": "EUR", "from_amount": 400, "fee_bps": 20}
           ]
         }
       ],
@@ -125,7 +131,11 @@
             "fx_rates": {"USD": 7.1, "EUR": 7.8}
           },
           "cash_flows": [{"currency": "USD", "amount": 200}],
-          "trades": [{"holding_id": "frog-equity", "quantity_delta": -5}]
+          "trades": [{"holding_id": "frog-equity", "quantity_delta": -5}],
+          "fill_windows": [
+            {"kind": "sell", "key": "frog-equity", "capacity": 4, "price_low": 39, "price_high": 40, "settlement_steps": 1},
+            {"kind": "fx", "key": "USD->EUR", "capacity": 260, "price_low": 0.90, "price_high": 0.91, "settlement_steps": 1}
+          ]
         },
         {
           "step_id": "t2_fx_shock",

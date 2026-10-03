@@ -13,6 +13,7 @@ from risk_platform.path_engine import PathEngine
 from risk_platform.paths import load_paths
 from risk_platform.results import (
     ResultStore,
+    compare_disposal_policies,
     compare_path_results,
     load_path_run_result,
 )
@@ -188,6 +189,10 @@ class StressPathTests(unittest.TestCase):
                 "v2/rebalance",
                 "v2/action:sell_equity",
                 "v2/action:sell_and_buy_eur",
+                "v1/constrained:sell_equity",
+                "v1/constrained:sell_and_buy_eur",
+                "v2/constrained:sell_equity",
+                "v2/constrained:sell_and_buy_eur",
             },
         )
         for key, column in columns.items():
@@ -361,6 +366,194 @@ class StressPathTests(unittest.TestCase):
             ]
             self.assertIn("action:sell_equity", policies)
             self.assertIn("action:sell_and_buy_eur", policies)
+
+    def test_constrained_fills_settle_and_keep_future_funds_unusable(self) -> None:
+        path = make_path(
+            [
+                scenario("a", 50, 0.03, 7.1),
+                scenario("b", 40, 0.03, 7.1),
+                scenario("c", 40, 0.03, 7.3),
+                scenario("d", 40, 0.03, 7.3),
+            ],
+        )
+        path["limits"] = {"asset_concentration": {"frog-equity": 0.01}}
+        path["action_plans"] = [
+            {
+                "plan_id": "partial_sell",
+                "trigger_step_id": "t0",
+                "allocation": "priority",
+                "fill_price": "worst",
+                "orders": [
+                    {"order_id": "s1", "type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10}
+                ],
+            }
+        ]
+        path["steps"][1]["fill_windows"] = [
+            {"kind": "sell", "key": "frog-equity", "capacity": 4, "price_low": 39, "price_high": 40, "settlement_steps": 1}
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path_file = Path(directory) / "paths.json"
+            path_file.write_text(json.dumps({"paths": [path]}), encoding="utf-8")
+            loaded = load_paths(path_file)
+        result = self.engine.run("constrained", self.holdings, loaded)
+        policy = next(
+            item for item in result.results[0].policies
+            if item.policy == "constrained:partial_sell"
+        )
+        fill = policy.steps[1].action_reconciliation.fills[0]
+        self.assertEqual(fill.quantity, 4)
+        self.assertEqual(fill.unfilled_quantity, 6)
+        self.assertEqual(fill.fill_price, 39)
+        self.assertEqual(fill.settlement_step_id, "t2")
+        self.assertAlmostEqual(policy.steps[1].execution_ledger.quantities["frog-equity"], 16)
+        self.assertNotIn("USD", policy.steps[1].execution_ledger.available_cash)
+        self.assertAlmostEqual(
+            policy.steps[1].execution_ledger.pending_cash_local["USD"],
+            4 * 39 * (1 - 10 / 10000),
+        )
+        self.assertAlmostEqual(
+            policy.steps[2].pending_settled_base_amount,
+            4 * 39 * 7.1 * (1 - 10 / 10000),
+        )
+        for step in policy.steps:
+            self.assertAlmostEqual(
+                step.market_effect
+                + step.cash_flow_effect
+                + step.action_effect,
+                step.total_change,
+            )
+        self.assertIn(
+            "USD",
+            policy.steps[2].execution_ledger.available_cash,
+        )
+
+    def test_priority_capacity_is_fixed_before_losses_and_fee_counted_once(self) -> None:
+        base = make_path(
+            [
+                scenario("a", 50, 0.03, 7.1),
+                scenario("b", 40, 0.03, 7.1),
+                scenario("c", 40, 0.03, 7.1),
+            ],
+        )
+        base["limits"] = {"asset_concentration": {"frog-equity": 0.01}}
+        base["action_plans"] = [
+            {
+                "plan_id": "two_sells",
+                "trigger_step_id": "t0",
+                "allocation": "priority",
+                "orders": [
+                    {"order_id": "first", "type": "sell", "holding_id": "frog-equity", "quantity": 5, "fee_bps": 10},
+                    {"order_id": "second", "type": "sell", "holding_id": "frog-equity", "quantity": 5, "fee_bps": 10},
+                ],
+            }
+        ]
+        base["steps"][1]["fill_windows"] = [
+            {"kind": "sell", "key": "frog-equity", "capacity": 6, "price_low": 40, "price_high": 40, "settlement_steps": 0}
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path_file = Path(directory) / "paths.json"
+            path_file.write_text(json.dumps({"paths": [base]}), encoding="utf-8")
+            loaded = load_paths(path_file)
+        result = self.engine.run("priority", self.holdings, loaded)
+        policy = next(item for item in result.results[0].policies if item.policy == "constrained:two_sells")
+        fills = policy.steps[1].action_reconciliation.fills
+        self.assertEqual([(fill.order_id, fill.quantity) for fill in fills], [("first", 5), ("second", 1)])
+        self.assertAlmostEqual(
+            policy.steps[1].action_fees,
+            6 * 40 * 7.1 * 10 / 10000,
+        )
+        self.assertAlmostEqual(
+            policy.steps[2].action_fees,
+            0.0,
+        )
+
+    def test_cancel_keeps_fills_and_state_round_trip_blocks_rewritten_history(self) -> None:
+        path = make_path([
+            scenario("a", 50, 0.03, 7.1),
+            scenario("b", 40, 0.03, 7.1),
+            scenario("c", 40, 0.03, 7.1),
+        ])
+        path["limits"] = {"asset_concentration": {"frog-equity": 0.01}}
+        path["action_plans"] = [{
+            "plan_id": "cancel_me",
+            "trigger_step_id": "t0",
+            "orders": [
+                {"order_id": "s1", "type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 0}
+            ],
+        }]
+        path["steps"][1]["fill_windows"] = [
+            {"kind": "sell", "key": "frog-equity", "capacity": 4, "price_low": 40, "price_high": 40, "settlement_steps": 0}
+        ]
+        path["steps"][2]["cancellations"] = [{"plan_id": "cancel_me"}]
+        with tempfile.TemporaryDirectory() as directory:
+            path_file = Path(directory) / "paths.json"
+            path_file.write_text(json.dumps({"paths": [path]}), encoding="utf-8")
+            loaded = load_paths(path_file)
+            result = self.engine.run("cancel", self.holdings, loaded)
+            store = ResultStore(directory)
+            store.save(result)
+            restored = load_path_run_result(directory, "cancel")
+        policy = next(item for item in restored.results[0].policies if item.policy == "constrained:cancel_me")
+        self.assertEqual(policy.steps[2].canceled_action_order_ids, ("cancel_me:s1",))
+        self.assertEqual(policy.steps[2].execution_ledger.quantities["frog-equity"], 16)
+        self.assertEqual(policy.steps[2].execution_ledger.open_orders, ())
+        self.assertTrue(policy.execution_state is not None)
+        rewritten = json.loads(json.dumps(path))
+        rewritten["steps"][1]["scenario"]["equity_prices"]["FROG"] = 30
+        rewritten["version"] = 3
+        with tempfile.TemporaryDirectory() as directory:
+            path_file = Path(directory) / "paths.json"
+            path_file.write_text(json.dumps({"paths": [rewritten]}), encoding="utf-8")
+            rewritten_paths = load_paths(path_file)
+            with self.assertRaises(ValueError):
+                self.engine.resume("resume", self.holdings, rewritten_paths, restored)
+
+    def test_disposal_comparison_names_risk_drivers(self) -> None:
+        result = self.engine.run("compare", self.holdings, self.paths)
+        comparison = compare_disposal_policies(result)["stagflation_ladder"]["sell_equity"]
+        self.assertTrue(comparison["unfilled_orders"])
+        self.assertIn("insufficient_fills", comparison["risk_sources"])
+        self.assertIn("price_band_slippage", comparison["risk_sources"])
+        self.assertIn("fees", comparison["risk_sources"])
+        self.assertIn("settlement_lag", comparison["risk_sources"])
+
+    def test_resume_continues_from_saved_partial_fill_state(self) -> None:
+        broken = scenario("c", 40, 0.03, 7.3)
+        broken["fx_rates"] = {}
+        path = make_path([
+            scenario("a", 50, 0.03, 7.1),
+            scenario("b", 40, 0.03, 7.1),
+            broken,
+        ])
+        path["limits"] = {"asset_concentration": {"frog-equity": 0.01}}
+        path["action_plans"] = [{
+            "plan_id": "resume_plan",
+            "trigger_step_id": "t0",
+            "orders": [
+                {"order_id": "s1", "type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 10}
+            ],
+        }]
+        path["steps"][1]["fill_windows"] = [
+            {"kind": "sell", "key": "frog-equity", "capacity": 4, "price_low": 40, "price_high": 40, "settlement_steps": 0}
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path_file = Path(directory) / "paths.json"
+            path_file.write_text(json.dumps({"paths": [path]}), encoding="utf-8")
+            partial_paths = load_paths(path_file)
+            partial = self.engine.run("partial-run", self.holdings, partial_paths)
+            self.assertFalse(partial.complete)
+            repaired = json.loads(json.dumps(path))
+            repaired["steps"][2]["scenario"]["fx_rates"] = {"USD": 7.3, "EUR": 7.5}
+            path_file.write_text(json.dumps({"paths": [repaired]}), encoding="utf-8")
+            resumed_paths = load_paths(path_file)
+            resumed = self.engine.resume("resumed-run", self.holdings, resumed_paths, partial)
+        policy = next(item for item in resumed.results[0].policies if item.policy == "constrained:resume_plan")
+        self.assertTrue(policy.complete)
+        self.assertEqual(len(policy.steps), 3)
+        self.assertAlmostEqual(policy.steps[0].portfolio_value, policy.steps[0].portfolio_value)
+        self.assertEqual(policy.steps[1].action_reconciliation.fills[0].quantity, 4)
+        self.assertEqual(policy.steps[1].action_reconciliation.fills[0].fill_price, 40)
+        self.assertAlmostEqual(policy.steps[2].execution_ledger.quantities["frog-equity"], 16)
 
 
 if __name__ == "__main__":

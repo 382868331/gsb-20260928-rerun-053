@@ -156,6 +156,12 @@ class PathStepResult:
     action_fees: float = 0.0
     cash_flow_from_actions: float = 0.0
     action_reconciliation: "ActionReconciliation | None" = None
+    action_slippage: float = 0.0
+    pending_settlements: tuple[PendingSettlement, ...] = ()
+    pending_settled_base_amount: float = 0.0
+    canceled_action_order_ids: tuple[str, ...] = ()
+    execution_ledger: "StepExecutionLedger | None" = None
+    pre_limit_checks: tuple["LimitViolation", ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +188,17 @@ class ActionFill:
     base_gross_amount: float
     fee_base_amount: float
     base_net_amount: float
+    plan_id: str | None = None
+    order_id: str | None = None
+    requested_quantity: float | None = None
+    unfilled_quantity: float | None = None
+    fill_step_id: str | None = None
+    settlement_step_id: str | None = None
+    window_price_low: float | None = None
+    window_price_high: float | None = None
+    fill_price: float | None = None
+    slippage_base_amount: float = 0.0
+    status: str = "filled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +209,60 @@ class ActionReconciliation:
     fees: float
     cash_flow_from_actions: float
     fills: tuple[ActionFill, ...]
+    slippage: float = 0.0
+    requested_quantity: float = 0.0
+    filled_quantity: float = 0.0
+    unfilled_quantity: float = 0.0
+    pending_added_base_amount: float = 0.0
+    pending_settled_base_amount: float = 0.0
+    canceled_orders: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PendingSettlement:
+    """Executed proceeds whose funds remain unusable until settlement."""
+
+    type: str
+    plan_id: str
+    order_id: str
+    fill_step_id: str
+    settlement_step_id: str
+    currency: str
+    local_amount: float
+    gross_base_amount: float
+    fee_base_amount: float
+    net_base_amount_at_fill: float
+    holding_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UnfilledOrder:
+    plan_id: str
+    order_id: str
+    type: str
+    requested_quantity: float
+    filled_quantity: float
+    unfilled_quantity: float
+    holding_id: str | None = None
+    from_currency: str | None = None
+    to_currency: str | None = None
+    status: str = "open"
+
+
+@dataclass(frozen=True, slots=True)
+class StepExecutionLedger:
+    """End-of-step positions, usable funds and action accounting."""
+
+    quantities: dict[str, float]
+    available_cash: dict[str, float]
+    pending_cash_local: dict[str, float]
+    pending_cash_base: float
+    cumulative_fees: float
+    cumulative_slippage: float
+    cumulative_filled_base: float
+    cumulative_settled_base: float
+    cumulative_settlement_lag: float = 0.0
+    open_orders: tuple[UnfilledOrder, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +285,34 @@ class PolicyPathResult:
     first_trigger_step_id: str | None = None
     first_breaches: tuple[LimitViolation, ...] = ()
     unresolved_metrics: tuple[LimitViolation, ...] = ()
+    execution_mode: str = "immediate"
+    execution_state: "ExecutionState | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionState:
+    """Serializable replay state; executed history never changes on resume."""
+
+    policy: str
+    plan_id: str | None
+    mode: str
+    completed_step_index: int
+    quantities: dict[str, float]
+    available_cash: dict[str, float]
+    pending: tuple[PendingSettlement, ...]
+    open_orders: tuple[UnfilledOrder, ...]
+    canceled_order_ids: tuple[str, ...]
+    cumulative_fees: float
+    cumulative_slippage: float
+    cumulative_filled_base: float
+    cumulative_settled_base: float
+    cumulative_settlement_lag: float
+    external_cash_base: float
+    initial_value: float
+    previous_total: float
+    first_trigger_step_id: str | None = None
+    first_breaches: tuple[LimitViolation, ...] = ()
+    historical_step_fingerprints: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +372,22 @@ def path_run_result_from_dict(payload: dict[str, Any]) -> PathRunResult:
                     action_reconciliation=_action_reconciliation_from_dict(
                         step.get("action_reconciliation")
                     ),
+                    action_slippage=float(step.get("action_slippage", 0.0)),
+                    pending_settlements=tuple(
+                        PendingSettlement(**entry)
+                        for entry in step.get("pending_settlements", ())
+                    ),
+                    pending_settled_base_amount=float(
+                        step.get("pending_settled_base_amount", 0.0)
+                    ),
+                    canceled_action_order_ids=tuple(
+                        step.get("canceled_action_order_ids", ())
+                    ),
+                    execution_ledger=_ledger_from_dict(step.get("execution_ledger")),
+                    pre_limit_checks=tuple(
+                        LimitViolation(**entry)
+                        for entry in step.get("pre_limit_checks", ())
+                    ),
                 )
                 for step in policy["steps"]
             )
@@ -300,7 +415,11 @@ def path_run_result_from_dict(payload: dict[str, Any]) -> PathRunResult:
                 unresolved_metrics=tuple(
                     LimitViolation(**entry)
                     for entry in policy.get("unresolved_metrics", ())
-                )
+                ),
+                execution_mode=policy.get("execution_mode", "immediate"),
+                execution_state=_execution_state_from_dict(
+                    policy.get("execution_state")
+                ),
             )
         )
         results.append(
@@ -334,6 +453,35 @@ def _action_reconciliation_from_dict(
             base_gross_amount=float(fill["base_gross_amount"]),
             fee_base_amount=float(fill["fee_base_amount"]),
             base_net_amount=float(fill["base_net_amount"]),
+            plan_id=fill.get("plan_id"),
+            order_id=fill.get("order_id"),
+            requested_quantity=(
+                float(fill["requested_quantity"])
+                if fill.get("requested_quantity") is not None
+                else None
+            ),
+            unfilled_quantity=(
+                float(fill["unfilled_quantity"])
+                if fill.get("unfilled_quantity") is not None
+                else None
+            ),
+            fill_step_id=fill.get("fill_step_id"),
+            settlement_step_id=fill.get("settlement_step_id"),
+            window_price_low=(
+                float(fill["window_price_low"])
+                if fill.get("window_price_low") is not None
+                else None
+            ),
+            window_price_high=(
+                float(fill["window_price_high"])
+                if fill.get("window_price_high") is not None
+                else None
+            ),
+            fill_price=(
+                float(fill["fill_price"]) if fill.get("fill_price") is not None else None
+            ),
+            slippage_base_amount=float(fill.get("slippage_base_amount", 0.0)),
+            status=fill.get("status", "filled"),
         )
         for fill in value.get("fills", ())
     )
@@ -344,6 +492,105 @@ def _action_reconciliation_from_dict(
         fees=float(value["fees"]),
         cash_flow_from_actions=float(value["cash_flow_from_actions"]),
         fills=fills,
+        slippage=float(value.get("slippage", 0.0)),
+        requested_quantity=float(value.get("requested_quantity", 0.0)),
+        filled_quantity=float(value.get("filled_quantity", 0.0)),
+        unfilled_quantity=float(value.get("unfilled_quantity", 0.0)),
+        pending_added_base_amount=float(value.get("pending_added_base_amount", 0.0)),
+        pending_settled_base_amount=float(
+            value.get("pending_settled_base_amount", 0.0)
+        ),
+        canceled_orders=tuple(value.get("canceled_orders", ())),
+    )
+
+
+def _unfilled_order_from_dict(value: dict[str, Any]) -> UnfilledOrder:
+    return UnfilledOrder(
+        plan_id=value["plan_id"],
+        order_id=value["order_id"],
+        type=value["type"],
+        requested_quantity=float(value["requested_quantity"]),
+        filled_quantity=float(value["filled_quantity"]),
+        unfilled_quantity=float(value["unfilled_quantity"]),
+        holding_id=value.get("holding_id"),
+        from_currency=value.get("from_currency"),
+        to_currency=value.get("to_currency"),
+        status=value.get("status", "open"),
+    )
+
+
+def _pending_from_dict(value: dict[str, Any]) -> PendingSettlement:
+    return PendingSettlement(
+        type=value["type"],
+        plan_id=value["plan_id"],
+        order_id=value["order_id"],
+        fill_step_id=value["fill_step_id"],
+        settlement_step_id=value["settlement_step_id"],
+        currency=value["currency"],
+        local_amount=float(value["local_amount"]),
+        gross_base_amount=float(value["gross_base_amount"]),
+        fee_base_amount=float(value["fee_base_amount"]),
+        net_base_amount_at_fill=float(value["net_base_amount_at_fill"]),
+        holding_id=value.get("holding_id"),
+    )
+
+
+def _ledger_from_dict(value: dict[str, Any] | None) -> StepExecutionLedger | None:
+    if value is None:
+        return None
+    return StepExecutionLedger(
+        quantities={key: float(number) for key, number in value["quantities"].items()},
+        available_cash={
+            key: float(number) for key, number in value["available_cash"].items()
+        },
+        pending_cash_local={
+            key: float(number)
+            for key, number in value.get("pending_cash_local", {}).items()
+        },
+        pending_cash_base=float(value.get("pending_cash_base", 0.0)),
+        cumulative_fees=float(value.get("cumulative_fees", 0.0)),
+        cumulative_slippage=float(value.get("cumulative_slippage", 0.0)),
+        cumulative_filled_base=float(value.get("cumulative_filled_base", 0.0)),
+        cumulative_settled_base=float(value.get("cumulative_settled_base", 0.0)),
+        cumulative_settlement_lag=float(value.get("cumulative_settlement_lag", 0.0)),
+        open_orders=tuple(
+            _unfilled_order_from_dict(item) for item in value.get("open_orders", ())
+        ),
+    )
+
+
+def _execution_state_from_dict(value: dict[str, Any] | None) -> ExecutionState | None:
+    if value is None:
+        return None
+    return ExecutionState(
+        policy=value["policy"],
+        plan_id=value.get("plan_id"),
+        mode=value["mode"],
+        completed_step_index=int(value["completed_step_index"]),
+        quantities={key: float(number) for key, number in value["quantities"].items()},
+        available_cash={
+            key: float(number) for key, number in value["available_cash"].items()
+        },
+        pending=tuple(_pending_from_dict(item) for item in value.get("pending", ())),
+        open_orders=tuple(
+            _unfilled_order_from_dict(item) for item in value.get("open_orders", ())
+        ),
+        canceled_order_ids=tuple(value.get("canceled_order_ids", ())),
+        cumulative_fees=float(value.get("cumulative_fees", 0.0)),
+        cumulative_slippage=float(value.get("cumulative_slippage", 0.0)),
+        cumulative_filled_base=float(value.get("cumulative_filled_base", 0.0)),
+        cumulative_settled_base=float(value.get("cumulative_settled_base", 0.0)),
+        cumulative_settlement_lag=float(value.get("cumulative_settlement_lag", 0.0)),
+        external_cash_base=float(value.get("external_cash_base", 0.0)),
+        initial_value=float(value["initial_value"]),
+        previous_total=float(value["previous_total"]),
+        first_trigger_step_id=value.get("first_trigger_step_id"),
+        first_breaches=tuple(
+            LimitViolation(**entry) for entry in value.get("first_breaches", ())
+        ),
+        historical_step_fingerprints=tuple(
+            (item[0], item[1]) for item in value.get("historical_step_fingerprints", ())
+        ),
     )
 
 
@@ -377,6 +624,100 @@ def compare_path_results(
                     "cash_flow_from_actions": policy.total_cash_flow_from_actions,
                     "first_trigger_step_id": policy.first_trigger_step_id,
                 }
+    return table
+
+
+def compare_disposal_policies(
+    run: PathRunResult,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Compare hold, full-fill and constrained fills per action plan.
+
+    Differences are classified into execution shortfall, price slippage,
+    fees and settlement lag. Values are taken from step ledgers, so they
+    remain auditable even when a path replay is partial.
+    """
+    table: dict[str, dict[str, dict[str, Any]]] = {}
+    for path in run.results:
+        by_policy = {policy.policy: policy for policy in path.policies}
+        plans = {}
+        for name in by_policy:
+            if name.startswith("constrained:"):
+                plans[name.removeprefix("constrained:")] = name
+        for plan_id, constrained_name in plans.items():
+            constrained = by_policy[constrained_name]
+            immediate = by_policy.get(f"action:{plan_id}")
+            hold = by_policy.get("hold")
+            final_step = constrained.steps[-1] if constrained.steps else None
+            ledger = final_step.execution_ledger if final_step else None
+            driver = {
+                "status": path.status,
+                "constrained_final_value": constrained.final_value,
+                "immediate_final_value": immediate.final_value if immediate else None,
+                "hold_final_value": hold.final_value if hold else None,
+                "difference_vs_immediate": (
+                    constrained.final_value - immediate.final_value
+                    if immediate
+                    else None
+                ),
+                "unfilled_orders": (
+                    [asdict(item) for item in ledger.open_orders] if ledger else []
+                ),
+                "pending_settlement_local": (
+                    dict(ledger.pending_cash_local) if ledger else {}
+                ),
+                "pending_settlement_base": ledger.pending_cash_base if ledger else 0.0,
+                "cumulative_fees": ledger.cumulative_fees if ledger else 0.0,
+                "cumulative_price_slippage": (
+                    ledger.cumulative_slippage if ledger else 0.0
+                ),
+                "cumulative_filled_base": (
+                    ledger.cumulative_filled_base if ledger else 0.0
+                ),
+                "cumulative_settled_base": (
+                    ledger.cumulative_settled_base if ledger else 0.0
+                ),
+                "fees_difference_vs_immediate": (
+                    ledger.cumulative_fees
+                    - (immediate.total_action_fees if immediate else 0.0)
+                    if ledger
+                    else None
+                ),
+            }
+            immediate_fees = immediate.total_action_fees if immediate else 0.0
+            if immediate is not None and ledger is not None:
+                fee_difference = ledger.cumulative_fees - immediate_fees
+                explained = (
+                    ledger.cumulative_slippage
+                    + fee_difference
+                )
+                remaining_difference = (
+                    constrained.final_value
+                    - immediate.final_value
+                )
+                driver["price_band_effect"] = ledger.cumulative_slippage
+                driver["fee_difference"] = fee_difference
+                driver["settlement_lag_effect"] = ledger.cumulative_settlement_lag
+                driver["unfilled_and_settlement_lag_effect"] = (
+                    remaining_difference - explained - ledger.cumulative_settlement_lag
+                )
+                driver["risk_sources"] = [
+                    "price_band_slippage" if ledger.cumulative_slippage else None,
+                    "fees" if ledger.cumulative_fees else None,
+                    "settlement_lag" if any(
+                        fill.settlement_step_id != fill.fill_step_id
+                        for step in constrained.steps
+                        for fill in (
+                            step.action_reconciliation.fills
+                            if step.action_reconciliation
+                            else ()
+                        )
+                    ) else None,
+                    "insufficient_fills" if ledger.open_orders else None,
+                ]
+                driver["risk_sources"] = [
+                    item for item in driver["risk_sources"] if item is not None
+                ]
+            table.setdefault(path.path_id, {})[plan_id] = driver
     return table
 
 

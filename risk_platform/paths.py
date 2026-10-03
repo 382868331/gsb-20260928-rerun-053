@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +99,7 @@ class ActionOrder:
     from_currency: str | None = None
     to_currency: str | None = None
     from_amount: float | None = None
+    order_id: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ActionOrder":
@@ -119,6 +120,7 @@ class ActionOrder:
                 fee_bps=fee_bps,
                 holding_id=str(data["holding_id"]),
                 quantity=quantity,
+                order_id=(str(data["order_id"]) if data.get("order_id") is not None else None),
             )
         if order_type == "fx_conversion":
             required = ("from_currency", "to_currency", "from_amount")
@@ -134,6 +136,7 @@ class ActionOrder:
                 from_currency=str(data["from_currency"]).upper(),
                 to_currency=str(data["to_currency"]).upper(),
                 from_amount=from_amount,
+                order_id=(str(data["order_id"]) if data.get("order_id") is not None else None),
             )
         raise ValueError(f"Unsupported action type: {order_type}")
 
@@ -144,6 +147,7 @@ class ActionOrder:
                 "holding_id": self.holding_id,
                 "quantity": self.quantity,
                 "fee_bps": self.fee_bps,
+                "order_id": self.order_id,
             }
         return {
             "type": self.order_type,
@@ -151,7 +155,15 @@ class ActionOrder:
             "to_currency": self.to_currency,
             "from_amount": self.from_amount,
             "fee_bps": self.fee_bps,
+            "order_id": self.order_id,
         }
+
+    @property
+    def key(self) -> str:
+        """Instrument key consumed by one execution window capacity pool."""
+        if self.order_type == "sell":
+            return f"sell:{self.holding_id}"
+        return f"fx:{self.from_currency}->{self.to_currency}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +171,8 @@ class ActionPlan:
     plan_id: str
     trigger_step_id: str
     orders: tuple[ActionOrder, ...]
+    allocation: str = "priority"
+    fill_price: str = "worst"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ActionPlan":
@@ -169,10 +183,28 @@ class ActionPlan:
         orders = tuple(ActionOrder.from_dict(item) for item in data["orders"])
         if not orders:
             raise ValueError("Action plan requires at least one order")
+        allocation = str(data.get("allocation", "priority")).lower()
+        if allocation not in {"priority", "pro_rata"}:
+            raise ValueError("Action plan allocation must be priority or pro_rata")
+        fill_price = str(data.get("fill_price", "worst")).lower()
+        if fill_price not in {"worst", "mid", "best"}:
+            raise ValueError("Action plan fill_price must be worst, mid or best")
+        order_keys = [
+            (
+                str(item["order_id"])
+                if item.get("order_id") is not None
+                else str(index)
+            )
+            for index, item in enumerate(data["orders"])
+        ]
+        if len(order_keys) != len(set(order_keys)):
+            raise ValueError("Order ids must be unique within an action plan")
         return cls(
             plan_id=str(data["plan_id"]),
             trigger_step_id=str(data["trigger_step_id"]),
             orders=orders,
+            allocation=allocation,
+            fill_price=fill_price,
         )
 
     def canonical_dict(self) -> dict[str, Any]:
@@ -180,7 +212,93 @@ class ActionPlan:
             "plan_id": self.plan_id,
             "trigger_step_id": self.trigger_step_id,
             "orders": [order.canonical_dict() for order in self.orders],
+            "allocation": self.allocation,
+            "fill_price": self.fill_price,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class FillWindow:
+    """Tradable capacity available in one manual market step.
+
+    Sell windows are keyed by holding id and quote a local price band.
+    FX windows are keyed by a ``FROM->TO`` pair and quote to-currency
+    units delivered per one from-currency unit. ``settlement_steps`` is the
+    number of later path steps before executed funds become usable.
+    """
+
+    kind: str
+    key: str
+    capacity: float
+    price_low: float
+    price_high: float
+    settlement_steps: int = 0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "FillWindow":
+        kind = str(data.get("kind", "")).lower()
+        if kind not in {"sell", "fx"}:
+            raise ValueError("Fill window kind must be sell or fx")
+        required = ("key", "capacity", "price_low", "price_high")
+        missing = [name for name in required if name not in data]
+        if missing:
+            raise ValueError(f"Fill window missing fields: {', '.join(missing)}")
+        capacity = float(data["capacity"])
+        low = float(data["price_low"])
+        high = float(data["price_high"])
+        settlement_steps = int(data.get("settlement_steps", 0))
+        if capacity < 0 or low <= 0 or high <= 0 or high < low or settlement_steps < 0:
+            raise ValueError("Invalid fill window capacity, price band or settlement")
+        return cls(
+            kind=kind,
+            key=str(data["key"]),
+            capacity=capacity,
+            price_low=low,
+            price_high=high,
+            settlement_steps=settlement_steps,
+        )
+
+    def canonical_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "key": self.key,
+            "capacity": self.capacity,
+            "price_low": self.price_low,
+            "price_high": self.price_high,
+            "settlement_steps": self.settlement_steps,
+        }
+
+    @property
+    def mid_price(self) -> float:
+        return (self.price_low + self.price_high) / 2.0
+
+    def price_for(self, rule: str) -> float:
+        if rule == "best":
+            return self.price_high
+        if rule == "mid":
+            return self.mid_price
+        return self.price_low
+
+
+@dataclass(frozen=True, slots=True)
+class Cancellation:
+    step_id: str
+    plan_id: str
+    order_id: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Cancellation":
+        if "plan_id" not in data:
+            raise ValueError("Cancellation requires plan_id")
+        order_id = data.get("order_id")
+        return cls(
+            step_id="",
+            plan_id=str(data["plan_id"]),
+            order_id=None if order_id is None else str(order_id),
+        )
+
+    def canonical_dict(self) -> dict[str, Any]:
+        return {"plan_id": self.plan_id, "order_id": self.order_id}
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +307,8 @@ class PathStep:
     scenario: MarketScenario
     cash_flows: tuple[CashFlow, ...]
     trades: tuple[Trade, ...]
+    fill_windows: tuple[FillWindow, ...] = ()
+    cancellations: tuple[Cancellation, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PathStep":
@@ -201,6 +321,13 @@ class PathStep:
                 CashFlow.from_dict(item) for item in data.get("cash_flows", ())
             ),
             trades=tuple(Trade.from_dict(item) for item in data.get("trades", ())),
+            fill_windows=tuple(
+                FillWindow.from_dict(item) for item in data.get("fill_windows", ())
+            ),
+            cancellations=tuple(
+                Cancellation.from_dict(item)
+                for item in data.get("cancellations", ())
+            ),
         )
 
     def canonical_dict(self) -> dict[str, Any]:
@@ -209,6 +336,8 @@ class PathStep:
             "scenario": self.scenario.canonical_dict(),
             "cash_flows": [item.canonical_dict() for item in self.cash_flows],
             "trades": [item.canonical_dict() for item in self.trades],
+            "fill_windows": [item.canonical_dict() for item in self.fill_windows],
+            "cancellations": [item.canonical_dict() for item in self.cancellations],
         }
 
 
@@ -237,7 +366,17 @@ class StressPath:
         if missing:
             raise ValueError(f"Path is missing fields: {', '.join(missing)}")
 
-        steps = tuple(PathStep.from_dict(item) for item in data["steps"])
+        steps = [PathStep.from_dict(item) for item in data["steps"]]
+        steps = [
+            replace(
+                step,
+                cancellations=tuple(
+                    replace(item, step_id=step.step_id)
+                    for item in step.cancellations
+                ),
+            )
+            for step in steps
+        ]
         if len(steps) < 2:
             raise ValueError("A stress path needs an initial step and at least one move")
         step_ids = [step.step_id for step in steps]
@@ -260,12 +399,31 @@ class StressPath:
                 "Action plans reference unknown trigger steps: "
                 + ", ".join(unknown_trigger_steps)
             )
+        plan_by_id = {plan.plan_id: plan for plan in action_plans}
+        for step in steps:
+            for cancellation in step.cancellations:
+                plan = plan_by_id.get(cancellation.plan_id)
+                if plan is None:
+                    raise ValueError(
+                        f"Step {step.step_id} cancels unknown plan "
+                        f"{cancellation.plan_id}"
+                    )
+                if cancellation.order_id is not None:
+                    known = {
+                        order.order_id if order.order_id is not None else str(index)
+                        for index, order in enumerate(plan.orders)
+                    }
+                    if cancellation.order_id not in known:
+                        raise ValueError(
+                            f"Step {step.step_id} cancels unknown order "
+                            f"{cancellation.order_id} in plan {plan.plan_id}"
+                        )
 
         partial = cls(
             path_id=str(data["path_id"]),
             version=int(data["version"]),
             description=str(data.get("description", "")),
-            steps=steps,
+            steps=tuple(steps),
             limits=limits,
             action_plans=action_plans,
             fingerprint="",
@@ -275,7 +433,7 @@ class StressPath:
             path_id=partial.path_id,
             version=partial.version,
             description=partial.description,
-            steps=steps,
+            steps=partial.steps,
             limits=limits,
             action_plans=action_plans,
             fingerprint=digest,
@@ -312,6 +470,24 @@ class StressPath:
                         f"Path {self.path_id} step {step.step_id} trades unknown "
                         f"holding {trade.holding_id}"
                     )
+            for window in step.fill_windows:
+                if window.kind == "sell" and window.key not in holding_ids:
+                    raise ValueError(
+                        f"Path {self.path_id} step {step.step_id} fill window "
+                        f"references unknown holding {window.key}"
+                    )
+                if window.kind == "fx":
+                    parts = window.key.split("->")
+                    if len(parts) != 2:
+                        raise ValueError(
+                            f"FX fill window key must look like USD->EUR: {window.key}"
+                        )
+                    for currency in parts:
+                        if currency not in step.scenario.fx_rates:
+                            raise ValueError(
+                                f"FX fill window {window.key} requires an fx rate "
+                                f"for {currency}"
+                            )
         for plan in self.action_plans:
             for order in plan.orders:
                 if order.order_type == "sell":
