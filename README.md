@@ -88,8 +88,11 @@ python -m risk_platform.cli \
 用于继续买入或换汇。继续等待不需要任何动作，余款保持 disputed。
 
 `resettle` 把 disputed 金额交给新对手方，按 `fee_bps` 收取新费用并按
-`settlement_steps` 重新约定到账步骤；新费用是实际损失，原交易费用不退回，
-已到账部分不会重新冻结。`write_off` 把 disputed 金额确认为实际损失。
+`settlement_steps` 重新约定计划到账步骤；新费用是实际损失，原交易费用不退回，
+已到账部分不会重新冻结。重结算后的资金改为事件驱动：计划到账日到达不会
+自动入账，只有新对手方的实际到账通知（`settle` 事件）才把资金转为可用现金；
+旧对手方的通知记为 `stale_notice`，不重复记账。`write_off` 把 disputed
+金额确认为实际损失。
 步骤的 `settlement_effect` 记录当步结算造成的价值变化（撤销损失与新费用），
 与市场、现金流、成交影响一起精确闭合该步变动。
 

@@ -424,6 +424,7 @@ class PathEngine:
             remaining = instruction.amount_local
             matched = False
             had_settled = False
+            counterparty_mismatch = False
             for position, item in enumerate(pending):
                 if (
                     item.plan_id != instruction.plan_id
@@ -431,6 +432,15 @@ class PathEngine:
                 ):
                     continue
                 matched = True
+                if (
+                    instruction.counterparty
+                    and item.counterparty
+                    and instruction.counterparty != item.counterparty
+                ):
+                    # Notice from a previous counterparty after the order was
+                    # re-routed: keep as evidence, never credit or dispute.
+                    counterparty_mismatch = True
+                    continue
                 had_settled = had_settled or item.settled_local > 1e-12
                 if remaining <= 1e-12:
                     continue
@@ -465,7 +475,9 @@ class PathEngine:
                     updated, events=updated.events + (event,)
                 )
             if remaining > 1e-12:
-                if instruction.kind == "settle":
+                if counterparty_mismatch:
+                    kind = "stale_notice"
+                elif instruction.kind == "settle":
                     kind = "duplicate_receipt" if matched else "stale_notice"
                 else:
                     had_settled = had_settled or any(
@@ -529,6 +541,7 @@ class PathEngine:
                         extra_fees_base=item.extra_fees_base + fee_base,
                         settlement_step_id=path.steps[target_index].step_id,
                         counterparty=action.counterparty,
+                        awaiting_settlement_event=True,
                     )
                     cumulative_extra_fees += fee_base
                     settlement_effect -= fee_base
@@ -548,10 +561,13 @@ class PathEngine:
 
         # Scheduled settlement: only the still-outstanding amount arrives.
         # Rejected, written-off or fee-consumed portions never become cash.
+        # Re-settled amounts are event-driven: the planned date passing is
+        # not enough, only an actual arrival notice credits cash.
         for position, item in enumerate(pending):
             if (
                 item.settlement_step_id != step.step_id
                 or item.outstanding_local <= 1e-12
+                or item.awaiting_settlement_event
             ):
                 continue
             updated, applied, base_at_fill, lag = self._settle_amount(

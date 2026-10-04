@@ -241,6 +241,7 @@ class PendingSettlement:
     extra_fees_local: float = 0.0
     extra_fees_base: float = 0.0
     counterparty: str | None = None
+    awaiting_settlement_event: bool = False
     events: tuple["SettlementEvent", ...] = ()
 
     @property
@@ -603,6 +604,7 @@ def _pending_from_dict(value: dict[str, Any]) -> PendingSettlement:
         extra_fees_local=float(value.get("extra_fees_local", 0.0)),
         extra_fees_base=float(value.get("extra_fees_base", 0.0)),
         counterparty=value.get("counterparty"),
+        awaiting_settlement_event=bool(value.get("awaiting_settlement_event", False)),
         events=tuple(
             _settlement_event_from_dict(item) for item in value.get("events", ())
         ),
