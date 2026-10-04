@@ -307,8 +307,9 @@ class SettlementInstruction:
 
     A 'settle' event records an actual arrival of funds (possibly partial,
     early, late or duplicated); a 'reject' event records a counterparty
-    refusal for the given local amount. Funds only become usable through
-    these events or through scheduled settlement of the outstanding amount.
+    refusal for the given local amount. Original fills may settle on their
+    scheduled date, while re-routed funds only become usable on a valid
+    'settle' event from their current counterparty.
     """
 
     kind: str

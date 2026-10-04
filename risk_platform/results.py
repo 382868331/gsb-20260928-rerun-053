@@ -241,6 +241,7 @@ class PendingSettlement:
     extra_fees_local: float = 0.0
     extra_fees_base: float = 0.0
     counterparty: str | None = None
+    event_driven_settlement: bool = False
     events: tuple["SettlementEvent", ...] = ()
 
     @property
@@ -269,7 +270,9 @@ class SettlementEvent:
     ``write_off`` (realized loss), ``duplicate_receipt`` (arrival beyond the
     outstanding amount, not credited), ``late_rejection`` (refusal arriving
     after the funds were already settled or otherwise resolved) and
-    ``stale_notice`` (notice for an order with nothing left unresolved).
+    ``counterparty_mismatch`` (notice from a party other than the current
+    settlement counterparty) and ``stale_notice`` (notice for an order with
+    nothing left unresolved).
     ``applied_local`` is the amount that actually changed state.
     """
 
@@ -603,6 +606,9 @@ def _pending_from_dict(value: dict[str, Any]) -> PendingSettlement:
         extra_fees_local=float(value.get("extra_fees_local", 0.0)),
         extra_fees_base=float(value.get("extra_fees_base", 0.0)),
         counterparty=value.get("counterparty"),
+        event_driven_settlement=bool(
+            value.get("event_driven_settlement", False)
+        ),
         events=tuple(
             _settlement_event_from_dict(item) for item in value.get("events", ())
         ),

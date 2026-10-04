@@ -570,9 +570,18 @@ class SettlementFailureTests(unittest.TestCase):
         self.engine = PathEngine.default()
 
     @staticmethod
-    def build_path(step_extras=None, version=1):
-        scenarios = [scenario("a", 50, 0.03, 7.1)] + [
-            scenario(name, 40, 0.03, 7.1) for name in ("b", "c", "d", "e")
+    def build_path(
+        step_extras=None,
+        version=1,
+        *,
+        step_count=5,
+        quantity=10,
+        price=40,
+        fee_bps=10,
+    ):
+        names = ["a", "b", "c", "d", "e", "f", "g"]
+        scenarios = [scenario(names[0], 50, 0.03, 7.1)] + [
+            scenario(name, price, 0.03, 7.1) for name in names[1:step_count]
         ]
         extras = {
             1: {
@@ -580,9 +589,9 @@ class SettlementFailureTests(unittest.TestCase):
                     {
                         "kind": "sell",
                         "key": "frog-equity",
-                        "capacity": 10,
-                        "price_low": 40,
-                        "price_high": 40,
+                        "capacity": quantity,
+                        "price_low": price,
+                        "price_high": price,
                         "settlement_steps": 1,
                     }
                 ]
@@ -601,8 +610,8 @@ class SettlementFailureTests(unittest.TestCase):
                         "order_id": "s1",
                         "type": "sell",
                         "holding_id": "frog-equity",
-                        "quantity": 10,
-                        "fee_bps": 10,
+                        "quantity": quantity,
+                        "fee_bps": fee_bps,
                     }
                 ],
             }
@@ -629,6 +638,10 @@ class SettlementFailureTests(unittest.TestCase):
             3: {"settlement_actions": [
                 {"action": "resettle", "plan_id": "settle_plan", "order_id": "s1",
                  "counterparty": "cp-b", "fee_bps": 50, "settlement_steps": 1}
+            ]},
+            4: {"settlement_events": [
+                {"type": "settle", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 199.6 * (1 - 50 / 10000), "counterparty": "cp-b"}
             ]},
         })
         policy = self.run_policy(path)
@@ -666,7 +679,7 @@ class SettlementFailureTests(unittest.TestCase):
             199.6 * (1 - 50 / 10000),
         )
 
-        # The re-settled remainder arrives at the new settlement step.
+        # The re-settled remainder only arrives when cp-b confirms receipt.
         self.assertAlmostEqual(
             t4.execution_ledger.available_cash["USD"],
             200 + 199.6 * (1 - 50 / 10000),
@@ -708,6 +721,10 @@ class SettlementFailureTests(unittest.TestCase):
             3: {"settlement_actions": [
                 {"action": "resettle", "plan_id": "settle_plan", "order_id": "s1",
                  "counterparty": "cp-b", "fee_bps": 50, "settlement_steps": 1}
+            ]},
+            4: {"settlement_events": [
+                {"type": "settle", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 399.6 * (1 - 50 / 10000), "counterparty": "cp-b"}
             ]},
         }, version=3)
         loaded = load_path_dicts([wait, write_off, resettle])
@@ -800,6 +817,87 @@ class SettlementFailureTests(unittest.TestCase):
             ["reject", "write_off", "stale_notice"],
         )
 
+    def test_resettled_funds_require_new_counterparty_receipt(self) -> None:
+        extras = {
+            2: {"settlement_events": [
+                {"type": "settle", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 81.12, "counterparty": "cp-a"},
+                {"type": "reject", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 149.3025, "counterparty": "cp-a"},
+            ]},
+            3: {"settlement_actions": [
+                {"action": "resettle", "plan_id": "settle_plan", "order_id": "s1",
+                 "counterparty": "cp-b", "fee_bps": 40, "settlement_steps": 1}
+            ]},
+            4: {"settlement_events": [
+                {"type": "settle", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 148.70529, "counterparty": "cp-a"}
+            ]},
+            5: {"settlement_events": [
+                {"type": "settle", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 148.70529, "counterparty": "cp-b"}
+            ]},
+            6: {"settlement_events": [
+                {"type": "settle", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 148.70529, "counterparty": "cp-b"},
+                {"type": "settle", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 148.70529, "counterparty": "cp-a"}
+            ]},
+        }
+        path = self.build_path(
+            step_extras=extras,
+            step_count=7,
+            quantity=7,
+            price=33,
+            fee_bps=25,
+        )
+        policy = self.run_policy(path)
+        t2, t3, t4, t5, t6 = (policy.steps[index] for index in range(2, 7))
+
+        self.assertAlmostEqual(t2.execution_ledger.available_cash["USD"], 81.12)
+        self.assertAlmostEqual(
+            t2.execution_ledger.disputed_cash_local["USD"], 149.3025
+        )
+        self.assertAlmostEqual(
+            t3.execution_ledger.pending_cash_local["USD"], 148.70529
+        )
+        self.assertAlmostEqual(t3.execution_ledger.available_cash["USD"], 81.12)
+        self.assertAlmostEqual(
+            t3.execution_ledger.cumulative_settlement_extra_fees_base,
+            0.59721 * 7.1,
+        )
+        self.assertAlmostEqual(
+            t3.execution_ledger.cumulative_fees, 0.5775 * 7.1
+        )
+
+        self.assertEqual(t4.settlement_events[0].kind, "counterparty_mismatch")
+        self.assertAlmostEqual(t4.execution_ledger.available_cash["USD"], 81.12)
+        self.assertAlmostEqual(
+            t4.execution_ledger.pending_cash_local["USD"], 148.70529
+        )
+
+        self.assertEqual(t5.settlement_events[0].kind, "settle")
+        self.assertEqual(t5.settlement_events[0].counterparty, "cp-b")
+        self.assertAlmostEqual(
+            t5.execution_ledger.available_cash["USD"], 229.82529
+        )
+        self.assertFalse(t5.execution_ledger.pending_cash_local)
+
+        self.assertEqual(
+            [event.kind for event in t6.settlement_events],
+            ["duplicate_receipt", "stale_notice"],
+        )
+        self.assertAlmostEqual(
+            t6.execution_ledger.available_cash["USD"], 229.82529
+        )
+        self.assertEqual(
+            [event.kind for event in policy.execution_state.settlement_log],
+            [
+                "settle", "reject", "reschedule", "counterparty_mismatch",
+                "settle", "duplicate_receipt", "stale_notice",
+            ],
+        )
+
     def test_resume_with_settlement_events_matches_uninterrupted_run(self) -> None:
         extras = {
             2: {"settlement_events": [
@@ -812,12 +910,16 @@ class SettlementFailureTests(unittest.TestCase):
                 {"action": "resettle", "plan_id": "settle_plan", "order_id": "s1",
                  "counterparty": "cp-b", "fee_bps": 50, "settlement_steps": 1}
             ]},
+            4: {"settlement_events": [
+                {"type": "settle", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 199.6 * (1 - 50 / 10000), "counterparty": "cp-b"}
+            ]},
         }
         full = self.engine.run(
             "full", self.holdings, load_path_dicts([self.build_path(step_extras=extras)])
         )
         broken = self.build_path(step_extras=extras)
-        broken["steps"][3]["scenario"]["fx_rates"] = {}
+        broken["steps"][4]["scenario"]["fx_rates"] = {}
         partial = self.engine.run(
             "partial", self.holdings, load_path_dicts([broken])
         )

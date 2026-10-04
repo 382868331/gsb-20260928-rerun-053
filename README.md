@@ -80,16 +80,18 @@ python -m risk_platform.cli \
 
 ## 结算失败与补救
 
-受限成交的待结算资金只在真实结算事件发生时转为可用现金。步骤可以声明
-`settlement_events`（`settle` 实际到账、`reject` 对手方拒绝，金额可小于
-待结算余额以表示分批结算）和 `settlement_actions`（`resettle` 更换对手方
-重新结算、`write_off` 撤销余款认亏）。被拒绝的部分进入 disputed 状态：
-仍计入风险敞口与组合价值，但在原计划结算日到达时不会自动变成现金，也不能
-用于继续买入或换汇。继续等待不需要任何动作，余款保持 disputed。
+原成交的待结算资金可在计划结算日入账；被拒后 `resettle` 的余款只在新对手方
+真实 `settle` 到账通知到达时转为可用现金。步骤可以声明
+`settlement_events`（`settle` 实际到账、`reject` 对手方拒绝，金额可小于待结算
+余额以表示分批结算）和 `settlement_actions`（`resettle` 更换对手方重新结算、
+`write_off` 撤销余款认亏）。被拒绝的部分进入 disputed 状态：仍计入风险敞口与
+组合价值，但在计划结算日到达且没有到账通知时不会自动变成现金，也不能用于继续
+买入或换汇。继续等待不需要任何动作，余款保持 disputed。
 
 `resettle` 把 disputed 金额交给新对手方，按 `fee_bps` 收取新费用并按
-`settlement_steps` 重新约定到账步骤；新费用是实际损失，原交易费用不退回，
-已到账部分不会重新冻结。`write_off` 把 disputed 金额确认为实际损失。
+`settlement_steps` 记录新的计划到账日；该日期只用于核对，不会绕过实际到账通知
+自动入账。新费用是实际损失，原交易费用不退回，已到账部分不会重新冻结。
+`write_off` 把 disputed 金额确认为实际损失。
 步骤的 `settlement_effect` 记录当步结算造成的价值变化（撤销损失与新费用），
 与市场、现金流、成交影响一起精确闭合该步变动。
 
@@ -97,11 +99,12 @@ python -m risk_platform.cli \
 已核销金额和额外结算费用。`risk_platform.results.compare_settlement_outcomes`
 把继续等待、撤销余款、重新结算等分支（不同路径版本或多次运行）并排比较，
 分列实际损失（核销 + 额外费用 + 原交易费用）、暂时不可用资金和仍有争议的
-金额。重复到账记为 `duplicate_receipt`（只按欠款入账，不重复计现金）、已结清
-后收到的拒绝记为 `late_rejection`、已修正后收到的旧通知记为 `stale_notice`，
-全部保留在步骤与政策的结算事件日志（`settlement_events` / `settlement_log`）
-中。结算日志随 `execution_state` 一起序列化，重开中途研究后继续处理事件，
-得到的资金轨迹与不中断处理完全一致。
+金额。当前有效对手方之外的到账或拒收通知记为 `counterparty_mismatch`，不会
+入账；当前有效对手方重复到账记为 `duplicate_receipt`（只按欠款入账，不重复计
+现金）、已结清后收到的拒绝记为 `late_rejection`、已修正后收到的旧通知记为
+`stale_notice`，全部保留在步骤与政策的结算事件日志
+（`settlement_events` / `settlement_log`）中。结算日志随 `execution_state` 一起
+序列化，重开中途研究后继续处理事件，得到的资金轨迹与不中断处理完全一致。
 
 结果写入 <run-id>-paths.json，每个 (path_id, version) 默认并列 hold、
 rebalance 和每个 `action:<plan_id>` 方案；缺数据的路径以 partial 状态保存

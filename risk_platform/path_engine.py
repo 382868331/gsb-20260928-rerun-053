@@ -424,11 +424,30 @@ class PathEngine:
             remaining = instruction.amount_local
             matched = False
             had_settled = False
+            current_counterparty_rejected = False
             for position, item in enumerate(pending):
                 if (
                     item.plan_id != instruction.plan_id
                     or item.order_id != instruction.order_id
                 ):
+                    continue
+                if (
+                    item.event_driven_settlement
+                    and item.counterparty is not None
+                    and item.outstanding_local > 1e-12
+                    and instruction.counterparty != item.counterparty
+                ):
+                    current_counterparty_rejected = True
+                    step_events.append(SettlementEvent(
+                        step_id=step.step_id,
+                        plan_id=instruction.plan_id,
+                        order_id=instruction.order_id,
+                        kind="counterparty_mismatch",
+                        amount_local=instruction.amount_local,
+                        applied_local=0.0,
+                        counterparty=instruction.counterparty,
+                        note=instruction.note,
+                    ))
                     continue
                 matched = True
                 had_settled = had_settled or item.settled_local > 1e-12
@@ -464,9 +483,29 @@ class PathEngine:
                 pending[position] = replace(
                     updated, events=updated.events + (event,)
                 )
-            if remaining > 1e-12:
+            if remaining > 1e-12 and not current_counterparty_rejected:
                 if instruction.kind == "settle":
-                    kind = "duplicate_receipt" if matched else "stale_notice"
+                    last_reschedule = max((
+                        position
+                        for position, entry in enumerate(settlement_log)
+                        if entry.plan_id == instruction.plan_id
+                        and entry.order_id == instruction.order_id
+                        and entry.kind == "reschedule"
+                    ), default=-1)
+                    had_receipt = any(
+                        position > last_reschedule
+                        and entry.plan_id == instruction.plan_id
+                        and entry.order_id == instruction.order_id
+                        and entry.kind == "settle"
+                        and entry.applied_local > 1e-12
+                        and entry.counterparty == instruction.counterparty
+                        for position, entry in enumerate(settlement_log)
+                    )
+                    kind = (
+                        "duplicate_receipt"
+                        if matched or had_receipt
+                        else "stale_notice"
+                    )
                 else:
                     had_settled = had_settled or any(
                         entry.plan_id == instruction.plan_id
@@ -529,6 +568,7 @@ class PathEngine:
                         extra_fees_base=item.extra_fees_base + fee_base,
                         settlement_step_id=path.steps[target_index].step_id,
                         counterparty=action.counterparty,
+                        event_driven_settlement=True,
                     )
                     cumulative_extra_fees += fee_base
                     settlement_effect -= fee_base
@@ -546,11 +586,14 @@ class PathEngine:
                     updated, events=updated.events + (event,)
                 )
 
-        # Scheduled settlement: only the still-outstanding amount arrives.
-        # Rejected, written-off or fee-consumed portions never become cash.
+        # Scheduled settlement applies to the original trade expectation.
+        # Re-routed funds are event-driven: reaching the planned date without
+        # an actual receipt must not make them usable. Rejected, written-off
+        # or fee-consumed portions also never become cash.
         for position, item in enumerate(pending):
             if (
-                item.settlement_step_id != step.step_id
+                item.event_driven_settlement
+                or item.settlement_step_id != step.step_id
                 or item.outstanding_local <= 1e-12
             ):
                 continue
