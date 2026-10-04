@@ -162,6 +162,7 @@ class PathStepResult:
     canceled_action_order_ids: tuple[str, ...] = ()
     execution_ledger: "StepExecutionLedger | None" = None
     pre_limit_checks: tuple["LimitViolation", ...] = ()
+    settlement_event_results: tuple["SettlementEventResult", ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +234,12 @@ class PendingSettlement:
     fee_base_amount: float
     net_base_amount_at_fill: float
     holding_id: str | None = None
+    settlement_id: str | None = None
+    status: str = "pending"
+    counterparty: str | None = None
+    original_settlement_id: str | None = None
+    original_event_id: str | None = None
+    rejection_event_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +270,31 @@ class StepExecutionLedger:
     cumulative_settled_base: float
     cumulative_settlement_lag: float = 0.0
     open_orders: tuple[UnfilledOrder, ...] = ()
+    cumulative_settlement_fees: float = 0.0
+    cumulative_realized_settlement_loss_base: float = 0.0
+    disputed_receivables_base: float = 0.0
+    rejected_cash_local: dict[str, float] | None = None
+    rejected_cash_base: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementEventResult:
+    event_id: str
+    event_type: str
+    status: str
+    step_id: str
+    settlement_id: str | None = None
+    replacement_settlement_id: str | None = None
+    counterparty: str | None = None
+    currency: str | None = None
+    amount_local: float = 0.0
+    amount_base: float = 0.0
+    fee_base_amount: float = 0.0
+    cash_credited_base: float = 0.0
+    rejected_base: float = 0.0
+    canceled_base: float = 0.0
+    corrected_event_id: str | None = None
+    detail: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +332,7 @@ class ExecutionState:
     quantities: dict[str, float]
     available_cash: dict[str, float]
     pending: tuple[PendingSettlement, ...]
+    rejected: tuple[PendingSettlement, ...]
     open_orders: tuple[UnfilledOrder, ...]
     canceled_order_ids: tuple[str, ...]
     cumulative_fees: float
@@ -307,12 +340,17 @@ class ExecutionState:
     cumulative_filled_base: float
     cumulative_settled_base: float
     cumulative_settlement_lag: float
+    cumulative_settlement_fees: float
+    cumulative_realized_settlement_loss: float
     external_cash_base: float
     initial_value: float
     previous_total: float
     first_trigger_step_id: str | None = None
     first_breaches: tuple[LimitViolation, ...] = ()
     historical_step_fingerprints: tuple[tuple[str, str], ...] = ()
+    processed_settlement_event_ids: tuple[str, ...] = ()
+    superseded_notice_ids: tuple[str, ...] = ()
+    known_settlement_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,6 +425,10 @@ def path_run_result_from_dict(payload: dict[str, Any]) -> PathRunResult:
                     pre_limit_checks=tuple(
                         LimitViolation(**entry)
                         for entry in step.get("pre_limit_checks", ())
+                    ),
+                    settlement_event_results=tuple(
+                        SettlementEventResult(**entry)
+                        for entry in step.get("settlement_event_results", ())
                     ),
                 )
                 for step in policy["steps"]
@@ -532,6 +574,12 @@ def _pending_from_dict(value: dict[str, Any]) -> PendingSettlement:
         fee_base_amount=float(value["fee_base_amount"]),
         net_base_amount_at_fill=float(value["net_base_amount_at_fill"]),
         holding_id=value.get("holding_id"),
+        settlement_id=value.get("settlement_id"),
+        status=value.get("status", "pending"),
+        counterparty=value.get("counterparty"),
+        original_settlement_id=value.get("original_settlement_id"),
+        original_event_id=value.get("original_event_id"),
+        rejection_event_id=value.get("rejection_event_id"),
     )
 
 
@@ -553,6 +601,17 @@ def _ledger_from_dict(value: dict[str, Any] | None) -> StepExecutionLedger | Non
         cumulative_filled_base=float(value.get("cumulative_filled_base", 0.0)),
         cumulative_settled_base=float(value.get("cumulative_settled_base", 0.0)),
         cumulative_settlement_lag=float(value.get("cumulative_settlement_lag", 0.0)),
+        cumulative_settlement_fees=float(value.get("cumulative_settlement_fees", 0.0)),
+        cumulative_realized_settlement_loss_base=float(
+            value.get("cumulative_realized_settlement_loss_base", 0.0)
+        ),
+        disputed_receivables_base=float(value.get("disputed_receivables_base", 0.0)),
+        rejected_cash_local=(
+            {key: float(number) for key, number in value["rejected_cash_local"].items()}
+            if value.get("rejected_cash_local") is not None
+            else None
+        ),
+        rejected_cash_base=float(value.get("rejected_cash_base", 0.0)),
         open_orders=tuple(
             _unfilled_order_from_dict(item) for item in value.get("open_orders", ())
         ),
@@ -572,6 +631,7 @@ def _execution_state_from_dict(value: dict[str, Any] | None) -> ExecutionState |
             key: float(number) for key, number in value["available_cash"].items()
         },
         pending=tuple(_pending_from_dict(item) for item in value.get("pending", ())),
+        rejected=tuple(_pending_from_dict(item) for item in value.get("rejected", ())),
         open_orders=tuple(
             _unfilled_order_from_dict(item) for item in value.get("open_orders", ())
         ),
@@ -581,6 +641,10 @@ def _execution_state_from_dict(value: dict[str, Any] | None) -> ExecutionState |
         cumulative_filled_base=float(value.get("cumulative_filled_base", 0.0)),
         cumulative_settled_base=float(value.get("cumulative_settled_base", 0.0)),
         cumulative_settlement_lag=float(value.get("cumulative_settlement_lag", 0.0)),
+        cumulative_settlement_fees=float(value.get("cumulative_settlement_fees", 0.0)),
+        cumulative_realized_settlement_loss=float(
+            value.get("cumulative_realized_settlement_loss", 0.0)
+        ),
         external_cash_base=float(value.get("external_cash_base", 0.0)),
         initial_value=float(value["initial_value"]),
         previous_total=float(value["previous_total"]),
@@ -591,6 +655,9 @@ def _execution_state_from_dict(value: dict[str, Any] | None) -> ExecutionState |
         historical_step_fingerprints=tuple(
             (item[0], item[1]) for item in value.get("historical_step_fingerprints", ())
         ),
+        processed_settlement_event_ids=tuple(value.get("processed_settlement_event_ids", ())),
+        superseded_notice_ids=tuple(value.get("superseded_notice_ids", ())),
+        known_settlement_ids=tuple(value.get("known_settlement_ids", ())),
     )
 
 
@@ -666,6 +733,16 @@ def compare_disposal_policies(
                     dict(ledger.pending_cash_local) if ledger else {}
                 ),
                 "pending_settlement_base": ledger.pending_cash_base if ledger else 0.0,
+                "temporarily_unavailable_base": ledger.pending_cash_base if ledger else 0.0,
+                "disputed_receivables_base": (
+                    ledger.disputed_receivables_base if ledger else 0.0
+                ),
+                "realized_settlement_loss_base": (
+                    ledger.cumulative_realized_settlement_loss_base if ledger else 0.0
+                ),
+                "settlement_fees": (
+                    ledger.cumulative_settlement_fees if ledger else 0.0
+                ),
                 "cumulative_fees": ledger.cumulative_fees if ledger else 0.0,
                 "cumulative_price_slippage": (
                     ledger.cumulative_slippage if ledger else 0.0
@@ -713,6 +790,11 @@ def compare_disposal_policies(
                         )
                     ) else None,
                     "insufficient_fills" if ledger.open_orders else None,
+                    "disputed_receivables" if ledger.disputed_receivables_base else None,
+                    "settlement_loss" if ledger.cumulative_realized_settlement_loss_base else None,
+                    "replacement_settlement_fees"
+                    if ledger.cumulative_settlement_fees
+                    else None,
                 ]
                 driver["risk_sources"] = [
                     item for item in driver["risk_sources"] if item is not None

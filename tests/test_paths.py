@@ -555,6 +555,248 @@ class StressPathTests(unittest.TestCase):
         self.assertEqual(policy.steps[1].action_reconciliation.fills[0].fill_price, 40)
         self.assertAlmostEqual(policy.steps[2].execution_ledger.quantities["frog-equity"], 16)
 
+    def test_settlement_events_drive_availability_and_distinguish_branches(self) -> None:
+        def settlement_path(branch: str):
+            path = make_path([
+                scenario("a", 50, 0.03, 7.1),
+                scenario("b", 40, 0.03, 7.1),
+                scenario("c", 40, 0.03, 7.1),
+                scenario("d", 40, 0.03, 7.1),
+                scenario("e", 40, 0.03, 7.1),
+            ])
+            path["path_id"] = f"settlement_{branch}"
+            path["limits"] = {"asset_concentration": {"frog-equity": 0.01}}
+            path["action_plans"] = [{
+                "plan_id": "sell",
+                "trigger_step_id": "t0",
+                "allocation": "priority",
+                "fill_price": "worst",
+                "orders": [
+                    {"order_id": "s1", "type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 0}
+                ],
+            }]
+            path["steps"][1]["fill_windows"] = [
+                {"kind": "sell", "key": "frog-equity", "capacity": 10, "price_low": 40, "price_high": 40, "settlement_steps": 1}
+            ]
+            settlement_id = "sell:s1:t1"
+            path["steps"][2]["settlement_events"] = [
+                {"event_id": "partial-credit", "type": "settled", "settlement_id": settlement_id, "amount_local": 160}
+            ]
+            if branch == "wait":
+                path["steps"][3]["settlement_events"] = [
+                    {"event_id": "reject-remaining", "type": "rejected", "settlement_id": settlement_id, "amount_local": 240}
+                ]
+            elif branch == "cancel":
+                path["steps"][3]["settlement_events"] = [
+                    {"event_id": "abandon-remaining", "type": "canceled", "settlement_id": settlement_id, "amount_local": 240}
+                ]
+            else:
+                path["steps"][3]["settlement_events"] = [
+                    {"event_id": "reject-remaining", "type": "rejected", "settlement_id": settlement_id, "amount_local": 240},
+                    {
+                        "event_id": "move-to-new-agent",
+                        "type": "resubmitted",
+                        "settlement_id": settlement_id,
+                        "replacement_settlement_id": "new-agent-settlement",
+                        "amount_local": 240,
+                        "counterparty": "new-agent",
+                        "fee_bps": 20,
+                        "settlement_steps": 1,
+                    },
+                ]
+                path["steps"][4]["settlement_events"] = [
+                    {
+                        "event_id": "new-agent-credit",
+                        "type": "settled",
+                        "settlement_id": "new-agent-settlement",
+                        "amount_local": 240,
+                    },
+                    {
+                        "event_id": "late-old-rejection",
+                        "type": "rejected",
+                        "settlement_id": settlement_id,
+                        "amount_local": 240,
+                        "corrects_event_id": "reject-remaining",
+                    },
+                    {
+                        "event_id": "partial-credit",
+                        "type": "settled",
+                        "settlement_id": settlement_id,
+                        "amount_local": 160,
+                    },
+                ]
+            return path
+
+        branches = {}
+        all_paths = []
+        for branch in ("wait", "cancel", "resettle"):
+            raw_path = settlement_path(branch)
+            with tempfile.TemporaryDirectory() as directory:
+                path_file = Path(directory) / "paths.json"
+                path_file.write_text(
+                    json.dumps({"paths": [raw_path]}),
+                    encoding="utf-8",
+                )
+                loaded = load_paths(path_file)
+                all_paths.extend(loaded)
+            run = self.engine.run(f"settlement-{branch}", self.holdings, loaded)
+            branches[branch] = next(
+                policy for policy in run.results[0].policies
+                if policy.policy == "constrained:sell"
+            )
+
+        wait_ledger = branches["wait"].steps[-1].execution_ledger
+        self.assertAlmostEqual(wait_ledger.available_cash["USD"], 160)
+        self.assertNotIn("USD", wait_ledger.pending_cash_local)
+        self.assertAlmostEqual(wait_ledger.rejected_cash_local["USD"], 240)
+        self.assertAlmostEqual(wait_ledger.disputed_receivables_base, 240 * 7.1)
+        self.assertAlmostEqual(wait_ledger.cumulative_realized_settlement_loss_base, 0.0)
+        self.assertAlmostEqual(wait_ledger.cumulative_settlement_fees, 0.0)
+
+        cancel_ledger = branches["cancel"].steps[-1].execution_ledger
+        self.assertAlmostEqual(cancel_ledger.available_cash["USD"], 160)
+        self.assertAlmostEqual(cancel_ledger.disputed_receivables_base, 0.0)
+        self.assertAlmostEqual(
+            cancel_ledger.cumulative_realized_settlement_loss_base,
+            240 * 7.1,
+        )
+
+        resettle_ledger = branches["resettle"].steps[-1].execution_ledger
+        self.assertAlmostEqual(resettle_ledger.available_cash["USD"], 400 - 4.8 / 10)
+        self.assertNotIn("USD", resettle_ledger.rejected_cash_local)
+        self.assertAlmostEqual(resettle_ledger.cumulative_realized_settlement_loss_base, 0.0)
+        self.assertAlmostEqual(resettle_ledger.cumulative_settlement_fees, 240 * 7.1 * 20 / 10000)
+        self.assertAlmostEqual(
+            resettle_ledger.cumulative_settled_base,
+            400 * 7.1 - 240 * 7.1 * 20 / 10000,
+        )
+        final_events = {
+            item.event_id: item
+            for item in branches["resettle"].steps[-1].settlement_event_results
+        }
+        self.assertEqual(final_events["new-agent-credit"].status, "applied")
+        self.assertEqual(final_events["late-old-rejection"].status, "ignored_stale")
+        self.assertEqual(final_events["partial-credit"].status, "ignored_duplicate")
+
+        comparison_run = self.engine.run("compare-branches", self.holdings, all_paths)
+        comparison = compare_disposal_policies(comparison_run)
+        self.assertEqual(
+            set(comparison),
+            {"settlement_wait", "settlement_cancel", "settlement_resettle"},
+        )
+        self.assertAlmostEqual(
+            comparison["settlement_wait"]["sell"]["disputed_receivables_base"],
+            240 * 7.1,
+        )
+        self.assertAlmostEqual(
+            comparison["settlement_cancel"]["sell"]["realized_settlement_loss_base"],
+            240 * 7.1,
+        )
+        self.assertAlmostEqual(
+            comparison["settlement_resettle"]["sell"]["settlement_fees"],
+            240 * 7.1 * 20 / 10000,
+        )
+
+    def test_resume_settlement_events_reproduces_uninterrupted_cash_path(self) -> None:
+        def path_payload(broken: bool):
+            path = make_path([
+                scenario("a", 50, 0.03, 7.1),
+                scenario("b", 40, 0.03, 7.1),
+                scenario("c", 40, 0.03, 7.1),
+                scenario("d", 40, 0.03, 7.1),
+                scenario("e", 40, 0.03, 7.1),
+            ], path_id="resume_settlement")
+            if broken:
+                path["steps"][3]["scenario"]["fx_rates"] = {}
+            path["limits"] = {"asset_concentration": {"frog-equity": 0.01}}
+            path["action_plans"] = [{
+                "plan_id": "sell",
+                "trigger_step_id": "t0",
+                "fill_price": "worst",
+                "orders": [
+                    {"order_id": "s1", "type": "sell", "holding_id": "frog-equity", "quantity": 10, "fee_bps": 0}
+                ],
+            }]
+            path["steps"][1]["fill_windows"] = [
+                {"kind": "sell", "key": "frog-equity", "capacity": 10, "price_low": 40, "price_high": 40, "settlement_steps": 1}
+            ]
+            settlement_id = "sell:s1:t1"
+            path["steps"][2]["settlement_events"] = [
+                {"event_id": "partial", "type": "settled", "settlement_id": settlement_id, "amount_local": 160},
+                {"event_id": "rejected", "type": "rejected", "settlement_id": settlement_id, "amount_local": 240},
+            ]
+            path["steps"][3]["settlement_events"] = [
+                {
+                    "event_id": "resubmit",
+                    "type": "resubmitted",
+                    "settlement_id": settlement_id,
+                    "replacement_settlement_id": "replacement",
+                    "amount_local": 240,
+                    "fee_bps": 20,
+                    "settlement_steps": 1,
+                }
+            ]
+            path["steps"][4]["settlement_events"] = [
+                {"event_id": "replacement-paid", "type": "settled", "settlement_id": "replacement", "amount_local": 240},
+                {"event_id": "partial", "type": "settled", "settlement_id": settlement_id, "amount_local": 160},
+            ]
+            return {"paths": [path]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            path_file = Path(directory) / "paths.json"
+            path_file.write_text(json.dumps(path_payload(True)), encoding="utf-8")
+            partial_run = self.engine.run(
+                "partial-settlement",
+                self.holdings,
+                load_paths(path_file),
+            )
+            store = ResultStore(directory)
+            store.save(partial_run)
+            loaded_partial = load_path_run_result(directory, "partial-settlement")
+            path_file.write_text(json.dumps(path_payload(False)), encoding="utf-8")
+            resumed_run = self.engine.resume(
+                "resumed-settlement",
+                self.holdings,
+                load_paths(path_file),
+                loaded_partial,
+            )
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
+            handle.write(json.dumps(path_payload(False)))
+            uninterrupted_path = Path(handle.name)
+        uninterrupted_run = self.engine.run(
+            "uninterrupted-settlement",
+            self.holdings,
+            load_paths(uninterrupted_path),
+        )
+        resumed_policy = next(
+            item for item in resumed_run.results[0].policies
+            if item.policy == "constrained:sell"
+        )
+        uninterrupted_policy = next(
+            item for item in uninterrupted_run.results[0].policies
+            if item.policy == "constrained:sell"
+        )
+        for resumed_step, uninterrupted_step in zip(
+            resumed_policy.steps, uninterrupted_policy.steps
+        ):
+            self.assertEqual(
+                resumed_step.execution_ledger.available_cash,
+                uninterrupted_step.execution_ledger.available_cash,
+            )
+            self.assertEqual(
+                resumed_step.execution_ledger.pending_cash_local,
+                uninterrupted_step.execution_ledger.pending_cash_local,
+            )
+            self.assertEqual(
+                resumed_step.execution_ledger.rejected_cash_local,
+                uninterrupted_step.execution_ledger.rejected_cash_local,
+            )
+            self.assertAlmostEqual(
+                resumed_step.portfolio_value,
+                uninterrupted_step.portfolio_value,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

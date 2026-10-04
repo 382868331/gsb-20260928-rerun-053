@@ -58,6 +58,18 @@ python -m risk_platform.cli \
 累计费用和价格滑点。限额只使用当时真实可用的持仓和已结算现金；待结算资金计入
 风险敞口和组合价值，但不能提前用于继续买入、换汇或其他对冲。
 
+路径一旦在任一步提供 settlement_events，fill_windows.settlement_steps
+就只表示原计划到账时间，不再在日期到达时自动释放现金。现金仅在按顺序重放
+settled/correction 事件时入账；rejected 把未到账部分转入仍有争议的应收款，
+仍计入组合价值和风险敞口但不可用；canceled/cancelled 才放弃余款并确认实际损失。
+resubmitted 可指定 replacement_settlement_id、新 counterparty、
+fee_bps 和新的 settlement_steps，已到账部分不会重新冻结，原交易费用也不会退回。
+重复 event_id 会保留为 ignored_duplicate；迟到且已无索赔可处理的旧通知保留为
+ignored_no_match；带 corrects_event_id 的更正先入账后，同 ID 旧通知保留为
+ignored_stale。每步台账分别列示 pending_cash_*（暂时不可用）、
+rejected_cash_*/disputed_receivables_base（仍有争议）和
+cumulative_realized_settlement_loss_base（实际损失）。
+
 同一时段多笔安排争用窗口容量时，计划必须在执行前指定 `allocation`：
 `priority` 按订单顺序，或 `pro_rata` 按当时可成交/可用资金比例。成交价格通过
 `fill_price` 在执行前固定为 `worst`、`mid` 或 `best`，不能看到后续损失后改选。

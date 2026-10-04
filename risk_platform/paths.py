@@ -302,6 +302,75 @@ class Cancellation:
 
 
 @dataclass(frozen=True, slots=True)
+class SettlementEvent:
+    """Observed settlement instruction or notification."""
+
+    event_id: str
+    settlement_id: str | None
+    event_type: str
+    amount_local: float | None = None
+    currency: str | None = None
+    counterparty: str | None = None
+    fee_bps: float = 0.0
+    settlement_steps: int | None = None
+    replacement_settlement_id: str | None = None
+    corrects_event_id: str | None = None
+    notice_step_id: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SettlementEvent":
+        missing = [key for key in ("event_id", "type") if key not in data]
+        if missing:
+            raise ValueError(f"Settlement event missing fields: {', '.join(missing)}")
+        event_type = str(data["type"]).lower()
+        allowed = {"settled", "rejected", "resubmitted", "canceled", "cancelled", "correction"}
+        if event_type not in allowed:
+            raise ValueError(f"Unsupported settlement event type: {event_type}")
+        amount = data.get("amount_local")
+        settlement_steps = data.get("settlement_steps")
+        fee_bps = float(data.get("fee_bps", 0.0))
+        if fee_bps < 0:
+            raise ValueError("Settlement fee_bps must not be negative")
+        if settlement_steps is not None and int(settlement_steps) < 0:
+            raise ValueError("Settlement event settlement_steps must not be negative")
+        optional_text = ("settlement_id", "currency", "counterparty", "replacement_settlement_id", "corrects_event_id", "notice_step_id")
+        values = {
+            name: None if data.get(name) is None else str(data[name])
+            for name in optional_text
+        }
+        if values["currency"] is not None:
+            values["currency"] = values["currency"].upper()
+        return cls(
+            event_id=str(data["event_id"]),
+            settlement_id=values["settlement_id"],
+            event_type=event_type,
+            amount_local=None if amount is None else float(amount),
+            currency=values["currency"],
+            counterparty=values["counterparty"],
+            fee_bps=fee_bps,
+            settlement_steps=None if settlement_steps is None else int(settlement_steps),
+            replacement_settlement_id=values["replacement_settlement_id"],
+            corrects_event_id=values["corrects_event_id"],
+            notice_step_id=values["notice_step_id"],
+        )
+
+    def canonical_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "settlement_id": self.settlement_id,
+            "type": self.event_type,
+            "amount_local": self.amount_local,
+            "currency": self.currency,
+            "counterparty": self.counterparty,
+            "fee_bps": self.fee_bps,
+            "settlement_steps": self.settlement_steps,
+            "replacement_settlement_id": self.replacement_settlement_id,
+            "corrects_event_id": self.corrects_event_id,
+            "notice_step_id": self.notice_step_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PathStep:
     step_id: str
     scenario: MarketScenario
@@ -309,6 +378,7 @@ class PathStep:
     trades: tuple[Trade, ...]
     fill_windows: tuple[FillWindow, ...] = ()
     cancellations: tuple[Cancellation, ...] = ()
+    settlement_events: tuple[SettlementEvent, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PathStep":
@@ -328,6 +398,10 @@ class PathStep:
                 Cancellation.from_dict(item)
                 for item in data.get("cancellations", ())
             ),
+            settlement_events=tuple(
+                SettlementEvent.from_dict(item)
+                for item in data.get("settlement_events", ())
+            ),
         )
 
     def canonical_dict(self) -> dict[str, Any]:
@@ -338,6 +412,7 @@ class PathStep:
             "trades": [item.canonical_dict() for item in self.trades],
             "fill_windows": [item.canonical_dict() for item in self.fill_windows],
             "cancellations": [item.canonical_dict() for item in self.cancellations],
+            "settlement_events": [item.canonical_dict() for item in self.settlement_events],
         }
 
 
