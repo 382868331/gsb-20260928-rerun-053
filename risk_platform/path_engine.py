@@ -16,6 +16,7 @@ from risk_platform.results import (
     PathStepResult,
     PendingSettlement,
     PolicyPathResult,
+    SettlementEvent,
     StepExecutionLedger,
     UnfilledOrder,
 )
@@ -385,6 +386,9 @@ class PathEngine:
         cumulative_lag: float,
         limits: RiskLimits,
         first_breaches: tuple[LimitViolation, ...] | None = None,
+        cumulative_written_off: float = 0.0,
+        cumulative_extra_fees: float = 0.0,
+        settlement_log: list[SettlementEvent] | None = None,
     ):
         step = path.steps[index]
         scenario = step.scenario
@@ -404,20 +408,176 @@ class PathEngine:
             cash_flow_effect += flow.amount * self._fx(scenario, flow.currency)
             new_cash[flow.currency] = new_cash.get(flow.currency, 0.0) + flow.amount
 
-        settled_now = [item for item in pending if item.settlement_step_id == step.step_id]
-        remaining_pending = [item for item in pending if item.settlement_step_id != step.step_id]
+        if settlement_log is None:
+            settlement_log = []
+        step_events: list[SettlementEvent] = []
+        settlement_effect = 0.0
         pending_settled_base = 0.0
-        for item in settled_now:
-            new_cash[item.currency] = (
-                new_cash.get(item.currency, 0.0) + item.local_amount
-            )
-            pending_settled_base += item.net_base_amount_at_fill
-        cumulative_settled += pending_settled_base
         settlement_lag = 0.0
-        for item in settled_now:
-            current_base = item.local_amount * self._fx(scenario, item.currency)
-            settlement_lag += current_base - item.net_base_amount_at_fill
+
+        # External settlement events: actual arrivals and rejections. Funds
+        # only move when an event (or the scheduled settlement below) says
+        # so; rejected amounts become disputed, never cash.
+        for instruction in step.settlement_events:
+            if instruction.plan_id != plan.plan_id:
+                continue
+            remaining = instruction.amount_local
+            matched = False
+            had_settled = False
+            for position, item in enumerate(pending):
+                if (
+                    item.plan_id != instruction.plan_id
+                    or item.order_id != instruction.order_id
+                ):
+                    continue
+                matched = True
+                had_settled = had_settled or item.settled_local > 1e-12
+                if remaining <= 1e-12:
+                    continue
+                if instruction.kind == "settle":
+                    updated, applied, base_at_fill, lag = self._settle_amount(
+                        item, remaining, new_cash, scenario
+                    )
+                    if applied <= 1e-12:
+                        continue
+                    pending_settled_base += base_at_fill
+                    settlement_lag += lag
+                else:
+                    applied = min(remaining, item.outstanding_local)
+                    if applied <= 1e-12:
+                        continue
+                    updated = replace(
+                        item, disputed_local=item.disputed_local + applied
+                    )
+                remaining -= applied
+                event = SettlementEvent(
+                    step_id=step.step_id,
+                    plan_id=instruction.plan_id,
+                    order_id=instruction.order_id,
+                    kind=instruction.kind,
+                    amount_local=instruction.amount_local,
+                    applied_local=applied,
+                    counterparty=instruction.counterparty,
+                    note=instruction.note,
+                )
+                step_events.append(event)
+                pending[position] = replace(
+                    updated, events=updated.events + (event,)
+                )
+            if remaining > 1e-12:
+                if instruction.kind == "settle":
+                    kind = "duplicate_receipt" if matched else "stale_notice"
+                else:
+                    had_settled = had_settled or any(
+                        entry.plan_id == instruction.plan_id
+                        and entry.order_id == instruction.order_id
+                        and entry.kind == "settle"
+                        and entry.applied_local > 1e-12
+                        for entry in settlement_log
+                    )
+                    kind = "late_rejection" if had_settled else "stale_notice"
+                step_events.append(SettlementEvent(
+                    step_id=step.step_id,
+                    plan_id=instruction.plan_id,
+                    order_id=instruction.order_id,
+                    kind=kind,
+                    amount_local=remaining,
+                    applied_local=0.0,
+                    counterparty=instruction.counterparty,
+                    note=instruction.note,
+                ))
+
+        # Remediation decisions for disputed (rejected) proceeds.
+        for action in step.settlement_actions:
+            if action.plan_id != plan.plan_id:
+                continue
+            for position, item in enumerate(pending):
+                if item.plan_id != action.plan_id or item.order_id != action.order_id:
+                    continue
+                disputed = item.disputed_local
+                if disputed <= 1e-12:
+                    continue
+                fx_rate = self._fx(scenario, item.currency)
+                if action.action == "write_off":
+                    loss_base = disputed * fx_rate
+                    updated = replace(
+                        item,
+                        disputed_local=0.0,
+                        written_off_local=item.written_off_local + disputed,
+                    )
+                    cumulative_written_off += loss_base
+                    settlement_effect -= loss_base
+                    event = SettlementEvent(
+                        step_id=step.step_id,
+                        plan_id=action.plan_id,
+                        order_id=action.order_id,
+                        kind="write_off",
+                        amount_local=disputed,
+                        applied_local=disputed,
+                        counterparty=item.counterparty,
+                    )
+                else:
+                    fee_local = disputed * action.fee_bps / 10000.0
+                    fee_base = fee_local * fx_rate
+                    target_index = min(
+                        index + action.settlement_steps, len(path.steps) - 1
+                    )
+                    updated = replace(
+                        item,
+                        disputed_local=0.0,
+                        extra_fees_local=item.extra_fees_local + fee_local,
+                        extra_fees_base=item.extra_fees_base + fee_base,
+                        settlement_step_id=path.steps[target_index].step_id,
+                        counterparty=action.counterparty,
+                    )
+                    cumulative_extra_fees += fee_base
+                    settlement_effect -= fee_base
+                    event = SettlementEvent(
+                        step_id=step.step_id,
+                        plan_id=action.plan_id,
+                        order_id=action.order_id,
+                        kind="reschedule",
+                        amount_local=disputed,
+                        applied_local=disputed,
+                        counterparty=action.counterparty,
+                    )
+                step_events.append(event)
+                pending[position] = replace(
+                    updated, events=updated.events + (event,)
+                )
+
+        # Scheduled settlement: only the still-outstanding amount arrives.
+        # Rejected, written-off or fee-consumed portions never become cash.
+        for position, item in enumerate(pending):
+            if (
+                item.settlement_step_id != step.step_id
+                or item.outstanding_local <= 1e-12
+            ):
+                continue
+            updated, applied, base_at_fill, lag = self._settle_amount(
+                item, item.outstanding_local, new_cash, scenario
+            )
+            pending_settled_base += base_at_fill
+            settlement_lag += lag
+            event = SettlementEvent(
+                step_id=step.step_id,
+                plan_id=item.plan_id,
+                order_id=item.order_id,
+                kind="settle",
+                amount_local=applied,
+                applied_local=applied,
+                counterparty=item.counterparty,
+                note="scheduled",
+            )
+            step_events.append(event)
+            pending[position] = replace(updated, events=updated.events + (event,))
+
+        settlement_log.extend(step_events)
+        cumulative_settled += pending_settled_base
         cumulative_lag += settlement_lag
+        remaining_pending = [
+            item for item in pending if item.unresolved_local > 1e-12
+        ]
 
         canceled_ids = []
         for cancellation in step.cancellations:
@@ -482,15 +642,19 @@ class PathEngine:
             )
             for item in post_breaches
         )
-        total_change = market_effect + cash_flow_effect + action_effect
+        total_change = (
+            market_effect + cash_flow_effect + action_effect + settlement_effect
+        )
         pending[:] = remaining_pending + added_pending
-        end_pending_map = self._pending_by_currency(tuple(pending))
+        end_unresolved_map = self._pending_by_currency(tuple(pending))
+        end_pending_map = self._outstanding_by_currency(pending)
+        end_disputed_map = self._disputed_by_currency(pending)
         portfolio_value = (
             post_value if index == 0 else start_previous_value + total_change
         )
         contributions = self._contributions(
             holdings, quantities, cash, start_pending_map, quantities, new_cash,
-            end_pending_map, scenario, previous_scenario,
+            end_unresolved_map, scenario, previous_scenario,
         )
         ledger = StepExecutionLedger(
             quantities=dict(quantities),
@@ -506,6 +670,14 @@ class PathEngine:
             cumulative_settled_base=cumulative_settled,
             cumulative_settlement_lag=cumulative_lag,
             open_orders=tuple(open_orders),
+            disputed_cash_local=end_disputed_map,
+            disputed_cash_base=sum(
+                amount * self._fx(scenario, currency)
+                for currency, amount in end_disputed_map.items()
+            ),
+            cumulative_written_off_base=cumulative_written_off,
+            cumulative_settlement_extra_fees_base=cumulative_extra_fees,
+            settlement_events=tuple(settlement_log),
         )
         reconciliation = ActionReconciliation(
             pre_action_value=pre_value,
@@ -547,14 +719,38 @@ class PathEngine:
             canceled_action_order_ids=tuple(canceled_ids),
             execution_ledger=ledger,
             pre_limit_checks=pre_breaches,
+            settlement_effect=settlement_effect,
+            settlement_events=tuple(step_events),
         )
         cash.clear()
         cash.update(new_cash)
         return (
             result, quantities, cash, pending, open_orders, cumulative_fees,
             cumulative_slippage, cumulative_filled, cumulative_settled,
-            cumulative_lag,
+            cumulative_lag, cumulative_written_off, cumulative_extra_fees,
         )
+
+    def _settle_amount(
+        self,
+        item: PendingSettlement,
+        amount: float,
+        cash: dict[str, float],
+        scenario: MarketScenario,
+    ):
+        """Credit up to ``amount`` of a pending record as usable cash."""
+        applied = min(amount, item.outstanding_local)
+        if applied <= 1e-12:
+            return item, 0.0, 0.0, 0.0
+        updated = replace(item, settled_local=item.settled_local + applied)
+        cash[item.currency] = cash.get(item.currency, 0.0) + applied
+        ratio = (
+            item.net_base_amount_at_fill / item.local_amount
+            if item.local_amount
+            else 0.0
+        )
+        base_at_fill = applied * ratio
+        lag = applied * self._fx(scenario, item.currency) - base_at_fill
+        return updated, applied, base_at_fill, lag
 
     def _initial_open_orders(self, plan: ActionPlan) -> list[UnfilledOrder]:
         orders = []
@@ -957,6 +1153,7 @@ class PathEngine:
             cumulative_slippage=0.0,
             cumulative_filled_base=cumulative_filled,
             cumulative_settled_base=cumulative_filled,
+            disputed_cash_local={},
         )
         result = PathStepResult(
             step_id=step.step_id,
@@ -1125,7 +1322,7 @@ class PathEngine:
         for item in pending:
             currency_exposures[item.currency] = (
                 currency_exposures.get(item.currency, 0.0)
-                + item.local_amount * self._fx(scenario, item.currency)
+                + item.unresolved_local * self._fx(scenario, item.currency)
             )
 
         for currency, threshold in limits.currency_exposure.items():
@@ -1207,7 +1404,7 @@ class PathEngine:
                 total += amount * self._fx(scenario, currency)
         else:
             for item in pending:
-                total += item.local_amount * self._fx(scenario, item.currency)
+                total += item.unresolved_local * self._fx(scenario, item.currency)
         return total
 
     @staticmethod
@@ -1216,7 +1413,33 @@ class PathEngine:
     ) -> dict[str, float]:
         totals = {}
         for item in pending:
-            totals[item.currency] = totals.get(item.currency, 0.0) + item.local_amount
+            totals[item.currency] = (
+                totals.get(item.currency, 0.0) + item.unresolved_local
+            )
+        return totals
+
+    @staticmethod
+    def _outstanding_by_currency(
+        pending: tuple[PendingSettlement, ...] | list[PendingSettlement],
+    ) -> dict[str, float]:
+        totals = {}
+        for item in pending:
+            if item.outstanding_local > 1e-12:
+                totals[item.currency] = (
+                    totals.get(item.currency, 0.0) + item.outstanding_local
+                )
+        return totals
+
+    @staticmethod
+    def _disputed_by_currency(
+        pending: tuple[PendingSettlement, ...] | list[PendingSettlement],
+    ) -> dict[str, float]:
+        totals = {}
+        for item in pending:
+            if item.disputed_local > 1e-12:
+                totals[item.currency] = (
+                    totals.get(item.currency, 0.0) + item.disputed_local
+                )
         return totals
 
     def _contributions(
@@ -1303,6 +1526,11 @@ class PathEngine:
             cumulative_filled = resume_state.cumulative_filled_base
             cumulative_settled = resume_state.cumulative_settled_base
             cumulative_lag = resume_state.cumulative_settlement_lag
+            cumulative_written_off = resume_state.cumulative_written_off_base
+            cumulative_extra_fees = (
+                resume_state.cumulative_settlement_extra_fees_base
+            )
+            settlement_log = list(resume_state.settlement_log)
             external_cash_base = resume_state.external_cash_base
             initial_value = resume_state.initial_value
             previous_total = resume_state.previous_total
@@ -1320,6 +1548,8 @@ class PathEngine:
             canceled = set()
             cumulative_fees = cumulative_slippage = cumulative_filled = 0.0
             cumulative_settled = external_cash_base = cumulative_lag = 0.0
+            cumulative_written_off = cumulative_extra_fees = 0.0
+            settlement_log: list[SettlementEvent] = []
             first_trigger = None
             first_breaches = ()
             steps = []
@@ -1342,6 +1572,8 @@ class PathEngine:
                     missing=str(error), cumulative_fees=0.0,
                     cumulative_slippage=0.0, cumulative_filled=0.0,
                     cumulative_settled=0.0, cumulative_lag=0.0,
+                    cumulative_written_off=0.0, cumulative_extra_fees=0.0,
+                    settlement_log=(),
                     external_cash_base=0.0, plan=plan,
                 )
             initial_hits = tuple(item for item in initial_breaches if item.status == "breached")
@@ -1353,13 +1585,16 @@ class PathEngine:
                 )
                 step_result, quantities, cash, pending, open_orders, cumulative_fees, \
                     cumulative_slippage, cumulative_filled, cumulative_settled, \
-                    cumulative_lag = \
+                    cumulative_lag, cumulative_written_off, cumulative_extra_fees = \
                     self._constrained_step(
                         holdings, path, 0, quantities, cash, pending, open_orders,
                         canceled, plan, initial_value, 0.0, cumulative_fees,
                         cumulative_slippage, cumulative_filled, cumulative_settled,
                         cumulative_lag,
                         path.limits, first_breaches=initial_hits,
+                        cumulative_written_off=cumulative_written_off,
+                        cumulative_extra_fees=cumulative_extra_fees,
+                        settlement_log=settlement_log,
                     )
                 previous_total = step_result.portfolio_value
                 post_breaches = step_result.limit_checks
@@ -1374,12 +1609,15 @@ class PathEngine:
             try:
                 step_result, quantities, cash, pending, open_orders, cumulative_fees, \
                     cumulative_slippage, cumulative_filled, cumulative_settled, \
-                    cumulative_lag = \
+                    cumulative_lag, cumulative_written_off, cumulative_extra_fees = \
                     self._constrained_step(
                         holdings, path, index, quantities, cash, pending, open_orders,
                         canceled, plan, initial_value, external_cash_base,
                         cumulative_fees, cumulative_slippage, cumulative_filled,
                         cumulative_settled, cumulative_lag, path.limits,
+                        cumulative_written_off=cumulative_written_off,
+                        cumulative_extra_fees=cumulative_extra_fees,
+                        settlement_log=settlement_log,
                     )
             except MissingMarketDataError as error:
                 missing = str(error)
@@ -1413,6 +1651,7 @@ class PathEngine:
             first_trigger, first_breaches, unresolved, missing, cumulative_fees,
             cumulative_slippage, cumulative_filled, cumulative_settled,
             cumulative_lag,
+            cumulative_written_off, cumulative_extra_fees, tuple(settlement_log),
             external_cash_base, plan,
         )
 
@@ -1438,6 +1677,9 @@ class PathEngine:
         cumulative_filled: float,
         cumulative_settled: float,
         cumulative_lag: float,
+        cumulative_written_off: float,
+        cumulative_extra_fees: float,
+        settlement_log: tuple[SettlementEvent, ...],
         external_cash_base: float,
         plan: ActionPlan,
     ) -> tuple[PolicyPathResult, str | None]:
@@ -1465,6 +1707,9 @@ class PathEngine:
             first_trigger_step_id=first_trigger,
             first_breaches=first_breaches,
             historical_step_fingerprints=fingerprints,
+            cumulative_written_off_base=cumulative_written_off,
+            cumulative_settlement_extra_fees_base=cumulative_extra_fees,
+            settlement_log=settlement_log,
         )
         result = PolicyPathResult(
             policy=policy,
@@ -1487,6 +1732,9 @@ class PathEngine:
             unresolved_metrics=unresolved,
             execution_mode="constrained",
             execution_state=state,
+            total_settlement_effect=sum(
+                step.settlement_effect for step in steps
+            ),
         )
         return result, missing
 

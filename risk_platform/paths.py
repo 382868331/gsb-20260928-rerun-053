@@ -302,6 +302,114 @@ class Cancellation:
 
 
 @dataclass(frozen=True, slots=True)
+class SettlementInstruction:
+    """An external settlement event observed at one path step.
+
+    A 'settle' event records an actual arrival of funds (possibly partial,
+    early, late or duplicated); a 'reject' event records a counterparty
+    refusal for the given local amount. Funds only become usable through
+    these events or through scheduled settlement of the outstanding amount.
+    """
+
+    kind: str
+    plan_id: str
+    order_id: str
+    amount_local: float
+    counterparty: str | None = None
+    note: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SettlementInstruction":
+        kind = str(data.get("type", "")).lower()
+        if kind not in {"settle", "reject"}:
+            raise ValueError("Settlement event type must be settle or reject")
+        missing = [
+            name for name in ("plan_id", "order_id", "amount_local") if name not in data
+        ]
+        if missing:
+            raise ValueError(
+                f"Settlement event missing fields: {', '.join(missing)}"
+            )
+        amount = float(data["amount_local"])
+        if amount <= 0:
+            raise ValueError("Settlement event amount_local must be positive")
+        return cls(
+            kind=kind,
+            plan_id=str(data["plan_id"]),
+            order_id=str(data["order_id"]),
+            amount_local=amount,
+            counterparty=(
+                str(data["counterparty"]) if data.get("counterparty") is not None else None
+            ),
+            note=str(data["note"]) if data.get("note") is not None else None,
+        )
+
+    def canonical_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.kind,
+            "plan_id": self.plan_id,
+            "order_id": self.order_id,
+            "amount_local": self.amount_local,
+            "counterparty": self.counterparty,
+            "note": self.note,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementAction:
+    """A remediation decision applied to rejected (disputed) proceeds.
+
+    'resettle' routes the disputed amount to a new counterparty with a new
+    fee and a new arrival lag; 'write_off' accepts the disputed amount as a
+    realized loss. Doing nothing keeps the amount disputed and unavailable.
+    """
+
+    action: str
+    plan_id: str
+    order_id: str
+    counterparty: str | None = None
+    fee_bps: float = 0.0
+    settlement_steps: int = 0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SettlementAction":
+        action = str(data.get("action", "")).lower()
+        if action not in {"resettle", "write_off"}:
+            raise ValueError("Settlement action must be resettle or write_off")
+        missing = [name for name in ("plan_id", "order_id") if name not in data]
+        if missing:
+            raise ValueError(
+                f"Settlement action missing fields: {', '.join(missing)}"
+            )
+        fee_bps = float(data.get("fee_bps", 0.0))
+        settlement_steps = int(data.get("settlement_steps", 0))
+        if fee_bps < 0 or settlement_steps < 0:
+            raise ValueError("Settlement action fee_bps/settlement_steps must not be negative")
+        if action == "resettle" and data.get("counterparty") is None:
+            raise ValueError("Resettle action requires a counterparty")
+        return cls(
+            action=action,
+            plan_id=str(data["plan_id"]),
+            order_id=str(data["order_id"]),
+            counterparty=(
+                str(data["counterparty"]) if data.get("counterparty") is not None else None
+            ),
+            fee_bps=fee_bps,
+            settlement_steps=settlement_steps,
+        )
+
+    def canonical_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action,
+            "plan_id": self.plan_id,
+            "order_id": self.order_id,
+            "counterparty": self.counterparty,
+            "fee_bps": self.fee_bps,
+            "settlement_steps": self.settlement_steps,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PathStep:
     step_id: str
     scenario: MarketScenario
@@ -309,6 +417,8 @@ class PathStep:
     trades: tuple[Trade, ...]
     fill_windows: tuple[FillWindow, ...] = ()
     cancellations: tuple[Cancellation, ...] = ()
+    settlement_events: tuple[SettlementInstruction, ...] = ()
+    settlement_actions: tuple[SettlementAction, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PathStep":
@@ -328,6 +438,14 @@ class PathStep:
                 Cancellation.from_dict(item)
                 for item in data.get("cancellations", ())
             ),
+            settlement_events=tuple(
+                SettlementInstruction.from_dict(item)
+                for item in data.get("settlement_events", ())
+            ),
+            settlement_actions=tuple(
+                SettlementAction.from_dict(item)
+                for item in data.get("settlement_actions", ())
+            ),
         )
 
     def canonical_dict(self) -> dict[str, Any]:
@@ -338,6 +456,8 @@ class PathStep:
             "trades": [item.canonical_dict() for item in self.trades],
             "fill_windows": [item.canonical_dict() for item in self.fill_windows],
             "cancellations": [item.canonical_dict() for item in self.cancellations],
+            "settlement_events": [item.canonical_dict() for item in self.settlement_events],
+            "settlement_actions": [item.canonical_dict() for item in self.settlement_actions],
         }
 
 
@@ -418,6 +538,38 @@ class StressPath:
                             f"Step {step.step_id} cancels unknown order "
                             f"{cancellation.order_id} in plan {plan.plan_id}"
                         )
+            for instruction in step.settlement_events:
+                plan = plan_by_id.get(instruction.plan_id)
+                if plan is None:
+                    raise ValueError(
+                        f"Step {step.step_id} settlement event references unknown "
+                        f"plan {instruction.plan_id}"
+                    )
+                known = {
+                    order.order_id if order.order_id is not None else str(index)
+                    for index, order in enumerate(plan.orders)
+                }
+                if instruction.order_id not in known:
+                    raise ValueError(
+                        f"Step {step.step_id} settlement event references unknown "
+                        f"order {instruction.order_id} in plan {plan.plan_id}"
+                    )
+            for action in step.settlement_actions:
+                plan = plan_by_id.get(action.plan_id)
+                if plan is None:
+                    raise ValueError(
+                        f"Step {step.step_id} settlement action references unknown "
+                        f"plan {action.plan_id}"
+                    )
+                known = {
+                    order.order_id if order.order_id is not None else str(index)
+                    for index, order in enumerate(plan.orders)
+                }
+                if action.order_id not in known:
+                    raise ValueError(
+                        f"Step {step.step_id} settlement action references unknown "
+                        f"order {action.order_id} in plan {plan.plan_id}"
+                    )
 
         partial = cls(
             path_id=str(data["path_id"]),

@@ -162,6 +162,8 @@ class PathStepResult:
     canceled_action_order_ids: tuple[str, ...] = ()
     execution_ledger: "StepExecutionLedger | None" = None
     pre_limit_checks: tuple["LimitViolation", ...] = ()
+    settlement_effect: float = 0.0
+    settlement_events: tuple[SettlementEvent, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +235,52 @@ class PendingSettlement:
     fee_base_amount: float
     net_base_amount_at_fill: float
     holding_id: str | None = None
+    settled_local: float = 0.0
+    disputed_local: float = 0.0
+    written_off_local: float = 0.0
+    extra_fees_local: float = 0.0
+    extra_fees_base: float = 0.0
+    counterparty: str | None = None
+    events: tuple["SettlementEvent", ...] = ()
+
+    @property
+    def outstanding_local(self) -> float:
+        """Amount still expected to arrive and become usable cash."""
+        return (
+            self.local_amount
+            - self.settled_local
+            - self.disputed_local
+            - self.written_off_local
+            - self.extra_fees_local
+        )
+
+    @property
+    def unresolved_local(self) -> float:
+        """Amount still counted in exposure: outstanding plus disputed."""
+        return self.outstanding_local + self.disputed_local
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementEvent:
+    """Evidence of one settlement-stage observation or decision.
+
+    ``kind`` is one of ``settle`` (actual arrival), ``reject`` (portion
+    refused), ``reschedule`` (re-routed to a new counterparty),
+    ``write_off`` (realized loss), ``duplicate_receipt`` (arrival beyond the
+    outstanding amount, not credited), ``late_rejection`` (refusal arriving
+    after the funds were already settled or otherwise resolved) and
+    ``stale_notice`` (notice for an order with nothing left unresolved).
+    ``applied_local`` is the amount that actually changed state.
+    """
+
+    step_id: str
+    plan_id: str
+    order_id: str
+    kind: str
+    amount_local: float
+    applied_local: float
+    counterparty: str | None = None
+    note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +311,11 @@ class StepExecutionLedger:
     cumulative_settled_base: float
     cumulative_settlement_lag: float = 0.0
     open_orders: tuple[UnfilledOrder, ...] = ()
+    disputed_cash_local: dict[str, float] | None = None
+    disputed_cash_base: float = 0.0
+    cumulative_written_off_base: float = 0.0
+    cumulative_settlement_extra_fees_base: float = 0.0
+    settlement_events: tuple[SettlementEvent, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +340,7 @@ class PolicyPathResult:
     unresolved_metrics: tuple[LimitViolation, ...] = ()
     execution_mode: str = "immediate"
     execution_state: "ExecutionState | None" = None
+    total_settlement_effect: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,6 +367,9 @@ class ExecutionState:
     first_trigger_step_id: str | None = None
     first_breaches: tuple[LimitViolation, ...] = ()
     historical_step_fingerprints: tuple[tuple[str, str], ...] = ()
+    cumulative_written_off_base: float = 0.0
+    cumulative_settlement_extra_fees_base: float = 0.0
+    settlement_log: tuple[SettlementEvent, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,7 +431,7 @@ def path_run_result_from_dict(payload: dict[str, Any]) -> PathRunResult:
                     ),
                     action_slippage=float(step.get("action_slippage", 0.0)),
                     pending_settlements=tuple(
-                        PendingSettlement(**entry)
+                        _pending_from_dict(entry)
                         for entry in step.get("pending_settlements", ())
                     ),
                     pending_settled_base_amount=float(
@@ -387,6 +444,11 @@ def path_run_result_from_dict(payload: dict[str, Any]) -> PathRunResult:
                     pre_limit_checks=tuple(
                         LimitViolation(**entry)
                         for entry in step.get("pre_limit_checks", ())
+                    ),
+                    settlement_effect=float(step.get("settlement_effect", 0.0)),
+                    settlement_events=tuple(
+                        _settlement_event_from_dict(entry)
+                        for entry in step.get("settlement_events", ())
                     ),
                 )
                 for step in policy["steps"]
@@ -419,6 +481,9 @@ def path_run_result_from_dict(payload: dict[str, Any]) -> PathRunResult:
                 execution_mode=policy.get("execution_mode", "immediate"),
                 execution_state=_execution_state_from_dict(
                     policy.get("execution_state")
+                ),
+                total_settlement_effect=float(
+                    policy.get("total_settlement_effect", 0.0)
                 ),
             )
         )
@@ -532,6 +597,28 @@ def _pending_from_dict(value: dict[str, Any]) -> PendingSettlement:
         fee_base_amount=float(value["fee_base_amount"]),
         net_base_amount_at_fill=float(value["net_base_amount_at_fill"]),
         holding_id=value.get("holding_id"),
+        settled_local=float(value.get("settled_local", 0.0)),
+        disputed_local=float(value.get("disputed_local", 0.0)),
+        written_off_local=float(value.get("written_off_local", 0.0)),
+        extra_fees_local=float(value.get("extra_fees_local", 0.0)),
+        extra_fees_base=float(value.get("extra_fees_base", 0.0)),
+        counterparty=value.get("counterparty"),
+        events=tuple(
+            _settlement_event_from_dict(item) for item in value.get("events", ())
+        ),
+    )
+
+
+def _settlement_event_from_dict(value: dict[str, Any]) -> SettlementEvent:
+    return SettlementEvent(
+        step_id=value["step_id"],
+        plan_id=value["plan_id"],
+        order_id=value["order_id"],
+        kind=value["kind"],
+        amount_local=float(value["amount_local"]),
+        applied_local=float(value["applied_local"]),
+        counterparty=value.get("counterparty"),
+        note=value.get("note"),
     )
 
 
@@ -555,6 +642,19 @@ def _ledger_from_dict(value: dict[str, Any] | None) -> StepExecutionLedger | Non
         cumulative_settlement_lag=float(value.get("cumulative_settlement_lag", 0.0)),
         open_orders=tuple(
             _unfilled_order_from_dict(item) for item in value.get("open_orders", ())
+        ),
+        disputed_cash_local={
+            key: float(number)
+            for key, number in (value.get("disputed_cash_local") or {}).items()
+        },
+        disputed_cash_base=float(value.get("disputed_cash_base", 0.0)),
+        cumulative_written_off_base=float(value.get("cumulative_written_off_base", 0.0)),
+        cumulative_settlement_extra_fees_base=float(
+            value.get("cumulative_settlement_extra_fees_base", 0.0)
+        ),
+        settlement_events=tuple(
+            _settlement_event_from_dict(item)
+            for item in value.get("settlement_events", ())
         ),
     )
 
@@ -590,6 +690,14 @@ def _execution_state_from_dict(value: dict[str, Any] | None) -> ExecutionState |
         ),
         historical_step_fingerprints=tuple(
             (item[0], item[1]) for item in value.get("historical_step_fingerprints", ())
+        ),
+        cumulative_written_off_base=float(value.get("cumulative_written_off_base", 0.0)),
+        cumulative_settlement_extra_fees_base=float(
+            value.get("cumulative_settlement_extra_fees_base", 0.0)
+        ),
+        settlement_log=tuple(
+            _settlement_event_from_dict(item)
+            for item in value.get("settlement_log", ())
         ),
     )
 
@@ -726,3 +834,57 @@ def load_path_run_result(directory: str | Path, run_id: str) -> PathRunResult:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     return path_run_result_from_dict(payload)
+
+
+def compare_settlement_outcomes(
+    runs: list[PathRunResult],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Compare settlement remediation branches across runs and versions.
+
+    Keyed by path_id, then ``"v<version>/<policy>"``. Each column separates
+    realized losses (written-off amounts, extra counterparty fees and the
+    original trade fees, which are never refunded) from temporarily
+    unavailable funds (outstanding pending) and amounts still in dispute.
+    Event-kind counts preserve the evidence trail (duplicate receipts, late
+    rejections, stale notices) for each branch.
+    """
+    table: dict[str, dict[str, dict[str, Any]]] = {}
+    for run in runs:
+        for result in run.results:
+            columns = table.setdefault(result.path_id, {})
+            for policy in result.policies:
+                final_step = policy.steps[-1] if policy.steps else None
+                ledger = final_step.execution_ledger if final_step else None
+                state = policy.execution_state
+                log: tuple[SettlementEvent, ...] = ()
+                if state is not None:
+                    log = state.settlement_log
+                elif ledger is not None:
+                    log = ledger.settlement_events
+                event_kinds: dict[str, int] = {}
+                for event in log:
+                    event_kinds[event.kind] = event_kinds.get(event.kind, 0) + 1
+                written_off = (
+                    ledger.cumulative_written_off_base if ledger else 0.0
+                )
+                extra_fees = (
+                    ledger.cumulative_settlement_extra_fees_base if ledger else 0.0
+                )
+                trade_fees = ledger.cumulative_fees if ledger else 0.0
+                columns[f"v{result.path_version}/{policy.policy}"] = {
+                    "run_id": run.run_id,
+                    "status": result.status,
+                    "settled_base": (
+                        ledger.cumulative_settled_base if ledger else 0.0
+                    ),
+                    "unavailable_pending_base": (
+                        ledger.pending_cash_base if ledger else 0.0
+                    ),
+                    "disputed_base": ledger.disputed_cash_base if ledger else 0.0,
+                    "written_off_base": written_off,
+                    "settlement_extra_fees_base": extra_fees,
+                    "trade_fees_base": trade_fees,
+                    "realized_loss_base": written_off + extra_fees + trade_fees,
+                    "settlement_event_kinds": event_kinds,
+                }
+    return table

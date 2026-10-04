@@ -15,6 +15,7 @@ from risk_platform.results import (
     ResultStore,
     compare_disposal_policies,
     compare_path_results,
+    compare_settlement_outcomes,
     load_path_run_result,
 )
 
@@ -45,6 +46,13 @@ def scenario(sid, price, yield_, usd, eur=7.8):
         "bond_yields": {"FROG-BOND-1Y": yield_},
         "fx_rates": {"USD": usd, "EUR": eur},
     }
+
+
+def load_path_dicts(path_dicts):
+    directory = tempfile.mkdtemp()
+    path_file = Path(directory) / "paths.json"
+    path_file.write_text(json.dumps({"paths": path_dicts}), encoding="utf-8")
+    return load_paths(path_file)
 
 
 class StressPathTests(unittest.TestCase):
@@ -554,6 +562,306 @@ class StressPathTests(unittest.TestCase):
         self.assertEqual(policy.steps[1].action_reconciliation.fills[0].quantity, 4)
         self.assertEqual(policy.steps[1].action_reconciliation.fills[0].fill_price, 40)
         self.assertAlmostEqual(policy.steps[2].execution_ledger.quantities["frog-equity"], 16)
+
+
+class SettlementFailureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.holdings = load_holdings(ROOT / "data" / "holdings.json")
+        self.engine = PathEngine.default()
+
+    @staticmethod
+    def build_path(step_extras=None, version=1):
+        scenarios = [scenario("a", 50, 0.03, 7.1)] + [
+            scenario(name, 40, 0.03, 7.1) for name in ("b", "c", "d", "e")
+        ]
+        extras = {
+            1: {
+                "fill_windows": [
+                    {
+                        "kind": "sell",
+                        "key": "frog-equity",
+                        "capacity": 10,
+                        "price_low": 40,
+                        "price_high": 40,
+                        "settlement_steps": 1,
+                    }
+                ]
+            }
+        }
+        for index, extra in (step_extras or {}).items():
+            extras.setdefault(index, {}).update(extra)
+        path = make_path(scenarios, version=version, step_extras=extras)
+        path["limits"] = {"asset_concentration": {"frog-equity": 0.01}}
+        path["action_plans"] = [
+            {
+                "plan_id": "settle_plan",
+                "trigger_step_id": "t0",
+                "orders": [
+                    {
+                        "order_id": "s1",
+                        "type": "sell",
+                        "holding_id": "frog-equity",
+                        "quantity": 10,
+                        "fee_bps": 10,
+                    }
+                ],
+            }
+        ]
+        return path
+
+    def run_policy(self, path, run_id="settlement"):
+        loaded = load_path_dicts([path])
+        result = self.engine.run(run_id, self.holdings, loaded)
+        return next(
+            item
+            for item in result.results[0].policies
+            if item.policy == "constrained:settle_plan"
+        )
+
+    def test_rejected_remainder_resettles_with_new_counterparty(self) -> None:
+        path = self.build_path(step_extras={
+            2: {"settlement_events": [
+                {"type": "settle", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 200},
+                {"type": "reject", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 199.6, "counterparty": "cp-a"},
+            ]},
+            3: {"settlement_actions": [
+                {"action": "resettle", "plan_id": "settle_plan", "order_id": "s1",
+                 "counterparty": "cp-b", "fee_bps": 50, "settlement_steps": 1}
+            ]},
+        })
+        policy = self.run_policy(path)
+        net_local = 10 * 40 * (1 - 10 / 10000)
+        self.assertAlmostEqual(net_local, 399.6)
+        t2, t3, t4 = policy.steps[2], policy.steps[3], policy.steps[4]
+
+        # Only the arrived 200 is cash; the rejected remainder is disputed
+        # and is not auto-converted at the originally planned date.
+        self.assertAlmostEqual(t2.execution_ledger.available_cash["USD"], 200)
+        self.assertAlmostEqual(
+            t2.execution_ledger.disputed_cash_local["USD"], 199.6
+        )
+        self.assertNotIn("USD", t2.execution_ledger.pending_cash_local)
+        self.assertEqual(
+            [event.kind for event in t2.settlement_events], ["settle", "reject"]
+        )
+
+        # Re-routing charges a new fee and sets a new arrival step; the
+        # settled 200 is not re-frozen and the original fee is not refunded.
+        extra_fee_base = 199.6 * 50 / 10000 * 7.1
+        self.assertEqual(t3.settlement_events[0].kind, "reschedule")
+        self.assertEqual(t3.settlement_events[0].counterparty, "cp-b")
+        self.assertAlmostEqual(t3.settlement_effect, -extra_fee_base)
+        self.assertAlmostEqual(
+            t3.execution_ledger.cumulative_settlement_extra_fees_base,
+            extra_fee_base,
+        )
+        self.assertAlmostEqual(t3.execution_ledger.available_cash["USD"], 200)
+        self.assertAlmostEqual(
+            t3.execution_ledger.cumulative_fees, 10 * 40 * 7.1 * 10 / 10000
+        )
+        self.assertAlmostEqual(
+            t3.execution_ledger.pending_cash_local["USD"],
+            199.6 * (1 - 50 / 10000),
+        )
+
+        # The re-settled remainder arrives at the new settlement step.
+        self.assertAlmostEqual(
+            t4.execution_ledger.available_cash["USD"],
+            200 + 199.6 * (1 - 50 / 10000),
+        )
+        self.assertAlmostEqual(
+            t4.execution_ledger.cumulative_settled_base,
+            (200 + 199.6 * (1 - 50 / 10000)) * 7.1,
+        )
+        self.assertAlmostEqual(policy.total_settlement_effect, -extra_fee_base)
+        for step in policy.steps:
+            self.assertAlmostEqual(
+                step.market_effect
+                + step.cash_flow_effect
+                + step.action_effect
+                + step.settlement_effect,
+                step.total_change,
+            )
+        self.assertAlmostEqual(
+            sum(step.total_change for step in policy.steps),
+            policy.final_value - policy.initial_value,
+        )
+
+    def test_settlement_branches_compare_wait_write_off_and_resettle(self) -> None:
+        reject = {
+            "settlement_events": [
+                {"type": "reject", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 399.6}
+            ]
+        }
+        wait = self.build_path(step_extras={2: reject}, version=1)
+        write_off = self.build_path(step_extras={
+            2: reject,
+            3: {"settlement_actions": [
+                {"action": "write_off", "plan_id": "settle_plan", "order_id": "s1"}
+            ]},
+        }, version=2)
+        resettle = self.build_path(step_extras={
+            2: reject,
+            3: {"settlement_actions": [
+                {"action": "resettle", "plan_id": "settle_plan", "order_id": "s1",
+                 "counterparty": "cp-b", "fee_bps": 50, "settlement_steps": 1}
+            ]},
+        }, version=3)
+        loaded = load_path_dicts([wait, write_off, resettle])
+        result = self.engine.run("branches", self.holdings, loaded)
+        table = compare_settlement_outcomes([result])["p"]
+        trade_fees = 10 * 40 * 7.1 * 10 / 10000
+
+        waiting = table["v1/constrained:settle_plan"]
+        self.assertAlmostEqual(waiting["disputed_base"], 399.6 * 7.1)
+        self.assertAlmostEqual(waiting["unavailable_pending_base"], 0.0)
+        self.assertAlmostEqual(waiting["written_off_base"], 0.0)
+        self.assertAlmostEqual(waiting["realized_loss_base"], trade_fees)
+
+        cancelled = table["v2/constrained:settle_plan"]
+        self.assertAlmostEqual(cancelled["written_off_base"], 399.6 * 7.1)
+        self.assertAlmostEqual(cancelled["disputed_base"], 0.0)
+        self.assertAlmostEqual(
+            cancelled["realized_loss_base"], 399.6 * 7.1 + trade_fees
+        )
+
+        rerouted = table["v3/constrained:settle_plan"]
+        extra_fee = 399.6 * 50 / 10000 * 7.1
+        self.assertAlmostEqual(rerouted["settlement_extra_fees_base"], extra_fee)
+        self.assertAlmostEqual(
+            rerouted["settled_base"], (399.6 - 399.6 * 50 / 10000) * 7.1
+        )
+        self.assertAlmostEqual(
+            rerouted["realized_loss_base"], extra_fee + trade_fees
+        )
+        self.assertEqual(rerouted["settlement_event_kinds"].get("reschedule"), 1)
+
+    def test_duplicate_receipt_is_recorded_not_credited(self) -> None:
+        path = self.build_path(step_extras={
+            2: {"settlement_events": [
+                {"type": "settle", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 500}
+            ]},
+        })
+        policy = self.run_policy(path)
+        t2 = policy.steps[2]
+        self.assertAlmostEqual(
+            t2.execution_ledger.available_cash["USD"], 399.6
+        )
+        duplicate = next(
+            event for event in t2.settlement_events
+            if event.kind == "duplicate_receipt"
+        )
+        self.assertAlmostEqual(duplicate.amount_local, 500 - 399.6)
+        self.assertEqual(duplicate.applied_local, 0.0)
+
+    def test_late_rejection_after_settlement_keeps_cash_and_evidence(self) -> None:
+        path = self.build_path(step_extras={
+            3: {"settlement_events": [
+                {"type": "reject", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 100}
+            ]},
+        })
+        policy = self.run_policy(path)
+        t2, t3 = policy.steps[2], policy.steps[3]
+        self.assertAlmostEqual(t2.execution_ledger.available_cash["USD"], 399.6)
+        self.assertAlmostEqual(t3.execution_ledger.available_cash["USD"], 399.6)
+        self.assertFalse(t3.execution_ledger.disputed_cash_local)
+        event = t3.settlement_events[0]
+        self.assertEqual(event.kind, "late_rejection")
+        self.assertEqual(event.applied_local, 0.0)
+
+    def test_correction_then_stale_notice_keeps_evidence(self) -> None:
+        path = self.build_path(step_extras={
+            2: {"settlement_events": [
+                {"type": "reject", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 399.6}
+            ]},
+            3: {"settlement_actions": [
+                {"action": "write_off", "plan_id": "settle_plan", "order_id": "s1"}
+            ]},
+            4: {"settlement_events": [
+                {"type": "reject", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 399.6}
+            ]},
+        })
+        policy = self.run_policy(path)
+        t4 = policy.steps[4]
+        self.assertEqual(t4.settlement_events[0].kind, "stale_notice")
+        self.assertEqual(t4.settlement_events[0].applied_local, 0.0)
+        self.assertAlmostEqual(
+            t4.execution_ledger.cumulative_written_off_base, 399.6 * 7.1
+        )
+        self.assertEqual(
+            [event.kind for event in policy.execution_state.settlement_log],
+            ["reject", "write_off", "stale_notice"],
+        )
+
+    def test_resume_with_settlement_events_matches_uninterrupted_run(self) -> None:
+        extras = {
+            2: {"settlement_events": [
+                {"type": "settle", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 200},
+                {"type": "reject", "plan_id": "settle_plan", "order_id": "s1",
+                 "amount_local": 199.6},
+            ]},
+            3: {"settlement_actions": [
+                {"action": "resettle", "plan_id": "settle_plan", "order_id": "s1",
+                 "counterparty": "cp-b", "fee_bps": 50, "settlement_steps": 1}
+            ]},
+        }
+        full = self.engine.run(
+            "full", self.holdings, load_path_dicts([self.build_path(step_extras=extras)])
+        )
+        broken = self.build_path(step_extras=extras)
+        broken["steps"][3]["scenario"]["fx_rates"] = {}
+        partial = self.engine.run(
+            "partial", self.holdings, load_path_dicts([broken])
+        )
+        self.assertFalse(partial.complete)
+        with tempfile.TemporaryDirectory() as directory:
+            ResultStore(directory).save(partial)
+            partial = load_path_run_result(directory, "partial")
+        resumed = self.engine.resume(
+            "resumed",
+            self.holdings,
+            load_path_dicts([self.build_path(step_extras=extras)]),
+            partial,
+        )
+        full_policy = next(
+            item for item in full.results[0].policies
+            if item.policy == "constrained:settle_plan"
+        )
+        resumed_policy = next(
+            item for item in resumed.results[0].policies
+            if item.policy == "constrained:settle_plan"
+        )
+        self.assertTrue(resumed_policy.complete)
+        self.assertEqual(len(resumed_policy.steps), len(full_policy.steps))
+        for resumed_step, full_step in zip(resumed_policy.steps, full_policy.steps):
+            self.assertEqual(
+                resumed_step.execution_ledger.available_cash,
+                full_step.execution_ledger.available_cash,
+            )
+            self.assertEqual(
+                resumed_step.execution_ledger.pending_cash_local,
+                full_step.execution_ledger.pending_cash_local,
+            )
+            self.assertEqual(
+                resumed_step.execution_ledger.disputed_cash_local,
+                full_step.execution_ledger.disputed_cash_local,
+            )
+            self.assertEqual(resumed_step.settlement_events, full_step.settlement_events)
+            self.assertAlmostEqual(
+                resumed_step.portfolio_value, full_step.portfolio_value
+            )
+        self.assertEqual(
+            resumed_policy.execution_state.settlement_log,
+            full_policy.execution_state.settlement_log,
+        )
 
 
 if __name__ == "__main__":
