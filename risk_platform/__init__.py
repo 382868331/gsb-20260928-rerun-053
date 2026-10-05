@@ -5,6 +5,7 @@ from risk_platform.holdings import Holding, load_holdings
 from risk_platform.path_engine import PathEngine
 from risk_platform.paths import StressPath, load_paths
 from risk_platform.pricing import CashPricer, EquityPricer, ZeroCouponBondPricer
+from risk_platform.receipt_allocations import AllocationStudy
 from risk_platform.scenarios import MarketScenario, load_scenarios
 
 __all__ = [
@@ -16,6 +17,7 @@ __all__ = [
     "RevaluationEngine",
     "StressPath",
     "ZeroCouponBondPricer",
+    "AllocationStudy",
     "load_holdings",
     "load_paths",
     "load_scenarios",
